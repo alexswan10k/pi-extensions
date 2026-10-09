@@ -15,36 +15,42 @@ Zero runtime dependencies — both use only `node:*` plus the host-provided
 
 ## Install
 
-Global (every project) — load the swarm only, keep the fence off by default:
+This repo is the source of truth; every project installs it from GitHub.
+
+Global (every Pi session, all machines):
 
 ```bash
-pi install /Users/alexanderswan/Source/Lambdasafe/pi-extensions
+pi install git:github.com/alexswan10k/pi-extensions
 ```
 
-then in `~/.pi/agent/settings.json` turn the plain entry into a filtered one:
+That loads all three extensions everywhere. The fence is usually only wanted in chosen
+repos, so turn the plain entry in `~/.pi/agent/settings.json` into a filtered one:
 
 ```json
-{ "source": "../../../Source/Lambdasafe/pi-extensions", "extensions": ["-extensions/ringfence.ts"] }
+{ "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["-extensions/ringfence.ts"] }
 ```
 
-Repo-level (e.g. `../voxtrk`, where the fence *is* wanted) — run from that project:
+Per-project (a repo where the fence *is* wanted) — run from that project:
 
 ```bash
-printf '{\n  "packages": ["../../pi-extensions"]\n}\n' > .pi/settings.json   # or: pi install -l <path>
+pi install -l git:github.com/alexswan10k/pi-extensions
 ```
 
 A project entry **replaces** the personal entry, so the project loads whatever the
-package declares (both extensions) unless it filters. Switch what loads per scope with
-`pi config` (Tab = global/project) and `pi list -a` to see resolved sources.
+package declares (all three) unless it filters. Switch what loads per scope with
+`pi config` (Tab = global/project) and `pi list -a` to see resolved sources. Git sources
+are identified by repo URL (ignoring the ref), so a global and a project entry never
+load twice.
 
-**Path gotcha:** a relative source resolves from the **directory holding the settings
-file** — `<project>/.pi` or `~/.pi/agent` — not from the project root. So from
-`<project>/.pi/settings.json` a sibling of the project is `../../pi-extensions`, and
-that is why `pi install` writes `../../../Source/...` into `~/.pi/agent/settings.json`.
-An absolute path also works (identity is the resolved path, so it never loads twice).
+Don't keep a hand-copied `.pi/extensions/` in a project: it shadows this package, drifts,
+and loads a second copy of the swarm. Delete it and install the source instead.
 
-After changing an extension: `/reload`, and restart every live session — a running pi
-keeps the extension it started with.
+Editing the extensions themselves? Clone and install the checkout —
+`pi install ./pi-extensions` loads the path without copying, so edits apply after
+`/reload` and restart of live sessions. A relative source resolves from the directory
+holding the settings file (`<project>/.pi` or `~/.pi/agent`), not the project root.
+
+Updating an installed git source: `pi update --extensions` (a pinned `@ref` stays pinned).
 
 ## ask_jev
 

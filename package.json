@@ -11,6 +11,10 @@
   ],
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/alexswan10k/pi-extensions.git"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
   },
