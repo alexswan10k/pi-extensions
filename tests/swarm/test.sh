@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Tests for extensions/workspace-swarm.ts (run through pi, needs a model for T1).
 #
-# -ne (not -na): only the explicit -e files load, so a user-level install of this
-# same package cannot double-load the extension under test.
+# -ne (not -na): only what we name with -e loads, so a user-level install of this same
+# package cannot double-load the extension under test. -ne also drops package-provided
+# *providers*, so the model's provider must be named too — override the list with
+# PI_TEST_PACKAGES (e.g. PI_TEST_PACKAGES="-e npm:pi-anthropic") if you use another.
 # Deterministic: each case runs pi in print mode (the way loop.sh does) with a
 # probe that dumps the outbound message array and then exits, so delivery is
 # asserted from the request itself — no model call, no asking a model to quote
@@ -12,6 +14,7 @@ D="$(cd "$(dirname "$0")" && pwd)"
 R="$(cd "$D/../.." && pwd)"
 EXT="$R/extensions/workspace-swarm.ts"
 PROBE="$D/probe.ts"
+read -ra PKGS <<< "${PI_TEST_PACKAGES:--e npm:pi-lmstudio}"
 P="$D/.tmp"
 rm -rf "$P"; mkdir -p "$P/.pi/cursors"
 BUS="$P/.pi/swarm.jsonl"; : > "$BUS"
@@ -30,7 +33,7 @@ run() { # tag [pi tool flag: -nt default, -t <names>] -> context dumped to $P/$t
   local tag="$1" tools="${2--nt}"   # ${2:-} would turn an explicit "" back into -nt
   ( export SWARM_DUMP="$P/$tag.json" SWARM_TOOLS="$P/tools.json" PI_AGENT_NAME="$tag" \
       PI_SWARM_CURSOR="${CS:-}" PI_SWARM_SELF_PREFIX="loop-" PI_SWARM_CHANNEL=loop
-    cd "$P" && pi -ne -e "$EXT" -e "$PROBE" --mode json $tools -p "x" >"$P/$tag.log" 2>&1 )
+    cd "$P" && pi -ne ${PKGS[@]+"${PKGS[@]}"} -e "$EXT" -e "$PROBE" --mode json $tools -p "x" >"$P/$tag.log" 2>&1 )
 }
 got()   { [ -s "$P/$1.json" ] && grep -qF -- "$2" "$P/$1.json"; }        # in outbound context
 nogot() { ! got "$1" "$2"; }
@@ -41,7 +44,7 @@ sender() { # tag msg — runs the extension's real send_swarm_message execute, n
       PI_AGENT_NAME="$tag" PI_SWARM_CHANNEL=loop
     # The probe imports the extension itself (pi hands each extension a private
     # API closure, so this is the only way to reach the real execute).
-    cd "$P" && pi -ne -e "$PROBE" --mode json -nt -p "x" >"$P/$tag.send.log" 2>&1 )
+    cd "$P" && pi -ne ${PKGS[@]+"${PKGS[@]}"} -e "$PROBE" --mode json -nt -p "x" >"$P/$tag.send.log" 2>&1 )
 }
 
 CS=brandnew
@@ -53,7 +56,7 @@ run a1;  got a1 "CANARY-NEW"   && ok "live traffic delivered" || bad T0b "missed
 
 echo "T1 a print-mode run still completes and exits (old bug: never exited)"
 ( export PI_AGENT_NAME=t1 PI_SWARM_CURSOR=t1c PI_SWARM_CHANNEL=loop PI_SWARM_SELF_PREFIX=loop-
-  cd "$P" && pi -ne -e "$EXT" --mode json -nt -p "Reply with exactly: OK" >"$P/t1.log" 2>&1 )
+  cd "$P" && pi -ne ${PKGS[@]+"${PKGS[@]}"} -e "$EXT" --mode json -nt -p "Reply with exactly: OK" >"$P/t1.log" 2>&1 )
 rc=$?; grep -qiE '"text":"ok' "$P/t1.log" && [ "$rc" = 0 ] \
   && ok "real turn finished, rc=0" || bad T1 "rc=$rc $(tail -c 200 "$P/t1.log")"
 

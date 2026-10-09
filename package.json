@@ -1,12 +1,13 @@
 {
   "name": "@lambdasafe/pi-extensions",
   "version": "0.1.0",
-  "description": "Lambdasafe Pi extensions: workspace-swarm (HTTP group chat / agent bus per workspace) and ringfence (default-deny guardrail around the workspace).",
+  "description": "Lambdasafe Pi extensions: workspace-swarm (HTTP group chat / agent bus per workspace), ringfence (default-deny guardrail around the workspace) and ask-jev (schema-shaped second opinions from a local LM Studio decision model).",
   "keywords": [
     "pi-package",
     "pi",
     "swarm",
-    "guardrail"
+    "guardrail",
+    "lmstudio"
   ],
   "license": "MIT",
   "type": "module",
@@ -14,6 +15,6 @@
     "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "test": "node extensions/ringfence.test.mjs && node extensions/workspace-swarm.test.mjs && node extensions/workspace-swarm.wake.test.mjs && node extensions/workspace-swarm.failover.test.mjs"
+    "test": "node extensions/ringfence.test.mjs && node extensions/ask-jev.test.mjs && node extensions/workspace-swarm.test.mjs && node extensions/workspace-swarm.wake.test.mjs && node extensions/workspace-swarm.failover.test.mjs"
   }
 }
