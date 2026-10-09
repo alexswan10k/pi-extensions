@@ -1,7 +1,7 @@
 {
   "name": "@lambdasafe/pi-extensions",
-  "version": "0.1.0",
-  "description": "Lambdasafe Pi extensions: workspace-swarm (HTTP group chat / agent bus per workspace), ringfence (default-deny guardrail around the workspace) and ask-jev (schema-shaped second opinions from a local LM Studio decision model).",
+  "version": "0.2.0",
+  "description": "Lambdasafe Pi extensions: workspace-swarm (HTTP group chat / agent bus per workspace), ringfence (default-deny guardrail around the workspace) and ask-jev (fast predicate/choice/score judgements from a local LM Studio decision model over many files).",
   "keywords": [
     "pi-package",
     "pi",
