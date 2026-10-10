@@ -47,11 +47,12 @@ const MIME: Record<string, string> = {
 };
 
 /**
- * Input size known to fit the instance's batch size, learned only from a refusal
- * (0 = never refused yet, so send the whole thing). A success proves nothing about
- * sizes we have not tried.
+ * Input size known to fit a given model's batch size, learned only from a refusal
+ * (absent = never refused yet, so send the whole thing). A success proves nothing about
+ * sizes we have not tried. Keyed per model: two decision models on one server can have
+ * different batch sizes, and a shared cap would cost the roomier one its headroom.
  */
-let fitChars = 0;
+const fitChars = new Map<string, number>();
 
 export type Question = {
 	name: string;
@@ -107,11 +108,11 @@ export function toAnswers(answers: any[]) {
 }
 
 /** One decisions request. Throws with a message the session model can act on. */
-export async function decide(input: string, images: string[] | undefined, questions: Question[], signal?: AbortSignal) {
+export async function decide(input: string, images: string[] | undefined, questions: Question[], signal?: AbortSignal, model = MODEL) {
 	const res = await fetch(`${BASE}/decisions`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
-		body: JSON.stringify({ model: MODEL, input, ...(images?.length ? { images } : {}), questions: toWire(questions) }),
+		body: JSON.stringify({ model, input, ...(images?.length ? { images } : {}), questions: toWire(questions) }),
 		signal: AbortSignal.any([AbortSignal.timeout(TIMEOUT_MS), ...(signal ? [signal] : [])]),
 	});
 	const raw = await res.text();
@@ -124,8 +125,8 @@ export async function decide(input: string, images: string[] | undefined, questi
 	}
 	const payload = JSON.parse(raw);
 	// LM Studio routes decisions by `model`, so a mismatch means we are not talking
-	// to the decision model at all. Fail loudly; a silent swap costs the big model.
-	if (payload.model && payload.model !== MODEL) throw new Error(`answered by "${payload.model}", not "${MODEL}"`);
+	// to the decision model we asked for. Fail loudly; a silent swap costs the big model.
+	if (payload.model && payload.model !== model) throw new Error(`answered by "${payload.model}", not "${model}"`);
 	return payload;
 }
 
@@ -134,13 +135,14 @@ export async function decide(input: string, images: string[] | undefined, questi
  * 500 that names the cap, so the first refusal teaches us the limit; we then cut and
  * retry, halving if the questions' own tokens still push us over.
  */
-export async function fittedAsk(material: string, images: string[] | undefined, questions: Question[], signal?: AbortSignal) {
+export async function fittedAsk(material: string, images: string[] | undefined, questions: Question[], signal?: AbortSignal, model = MODEL) {
 	for (let attempt = 0; ; attempt++) {
+		const fit = fitChars.get(model) || 0;
 		// First try the whole thing (or last known fit); after a refusal, back off by halves.
-		const budget = fitChars ? Math.max(120, Math.floor(fitChars / 2 ** Math.max(0, attempt - 1))) : material.length;
+		const budget = fit ? Math.max(120, Math.floor(fit / 2 ** Math.max(0, attempt - 1))) : material.length;
 		const input = images?.length ? "" : material.slice(0, budget);
 		try {
-			const payload = await decide(input, images, questions, signal);
+			const payload = await decide(input, images, questions, signal, model);
 			return images?.length
 				? { answers: toAnswers(payload.answers), truncated: false }
 				: { answers: toAnswers(payload.answers), judged_chars: input.length, truncated: input.length < material.length };
@@ -150,7 +152,7 @@ export async function fittedAsk(material: string, images: string[] | undefined, 
 			if (!m || attempt >= 3) throw err;
 			const perToken = input.length ? input.length / Number(m[1]) : 3;
 			// 0.8 leaves room for the questions' own tokens, which count against the same batch.
-			fitChars = Math.min(fitChars || Infinity, Math.max(120, Math.floor(Number(m[2]) * 0.8 * perToken)));
+			fitChars.set(model, Math.min(fit || Infinity, Math.max(120, Math.floor(Number(m[2]) * 0.8 * perToken))));
 		}
 	}
 }
