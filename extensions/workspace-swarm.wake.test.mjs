@@ -69,13 +69,13 @@ const C = makeSession(SAME_MS);
 await C.handlers.session_start({}, C.ctx);
 assert.notEqual((await roster()).length, 1, "two live sessions");
 assert.ok((await roster()).includes("01a116eb-9a9f-b3aa"), "the tail separates sessions started in the same millisecond");
-await C.handlers.session_end({}, C.ctx);
+await C.handlers.session_shutdown({ reason: "quit" }, C.ctx);
 
 // A resumed session (same session id) is the same agent, with its unread cursor.
 await human("before the restart");
 await sleep(1300); // one poll: A takes it
 assert.equal(A.sent.length, 1, "the live session is woken for the person's message");
-await A.handlers.session_end({}, A.ctx);
+await A.handlers.session_shutdown({ reason: "quit" }, A.ctx);
 
 // Simulate `pi --resume`: same session id, a brand-new extension instance.
 process.env.PI_AGENT_NAME = ""; // still session-derived
@@ -87,7 +87,7 @@ await human("after the restart");
 await sleep(1300);
 assert.equal(B.sent.length, 1, "and it still gets what arrives after the resume");
 assert.match(B.sent[0].text, /after the restart/);
-await B.handlers.session_end({}, B.ctx);
+await B.handlers.session_shutdown({ reason: "quit" }, B.ctx);
 
 // --- wake routing ------------------------------------------------------------
 process.env.PI_AGENT_NAME = "me"; // deterministic id for the rotation asserts
@@ -161,7 +161,7 @@ assert.equal(chatter.wake.length, 0, "peer chatter still wakes nobody: agents ca
 const asked = await api(base, "/api/messages", { sender: "peer-1", channel: "general", text: "@me your turn" });
 assert.deepEqual(asked.wake, ["me"], "agent-to-agent works headlessly on an @mention, no human involved");
 
-await M.handlers.session_end({}, M.ctx);
+await M.handlers.session_shutdown({ reason: "quit" }, M.ctx);
 clearInterval(keepalive);
 await api(base, "/api/bye", { id: "watcher" });
 await api(base, "/api/bye", { id: "otherbot" });

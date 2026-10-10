@@ -799,7 +799,7 @@ export default function workspaceSwarmExtension(pi: ExtensionAPI) {
   let deadCtx = 0; // consecutive isIdle() failures before the context counts as dead
   let nick = agentId; // display handle the hub gave us (see nickFor)
 
-  // pi -p can exit without ever reaching session_end. The OS reclaims the port
+  // pi -p can exit without ever reaching session_shutdown. The OS reclaims the port
   // anyway, so all this does is avoid leaving a hub.json that names a dead pid.
   // Stale is harmless either way: every client probes before it trusts the file.
   if (!(globalThis as any).__piSwarmExitHook) {
@@ -868,14 +868,20 @@ export default function workspaceSwarmExtension(pi: ExtensionAPI) {
       up: Math.round((Date.now() - act.started) / 1000),
       run: act.turnAt ? Math.round((Date.now() - act.turnAt) / 1000) : 0,
       pid: process.pid,
-      cwd: ctxRef?.cwd || process.cwd(),
+      cwd: process.cwd(),
       host: server ? 1 : 0,
       ev: ev.slice(-6),
     };
+    // Both ctx reads behind one try: selfStatus() also runs from the heartbeat
+    // timer, and pi throws on ANY property of a ctx it invalidated during a
+    // session swap — an uncaught throw inside a timer takes the whole process
+    // down (pi exits with the stale-ctx message). Same for a session file we
+    // cannot read yet.
     try {
+      s.cwd = ctxRef?.cwd || process.cwd();
       s.log = ctxRef?.sessionManager?.getSessionFile?.() || "";
     } catch {
-      /* no session file yet (a run that never wrote one) */
+      /* stale ctx or no session file: report what the process itself knows */
     }
     return s;
   };
@@ -1350,10 +1356,22 @@ export default function workspaceSwarmExtension(pi: ExtensionAPI) {
     event.messages.push({ role: "user", content: envelope(msgs) });
   });
 
-  pi.on("session_end", async () => {
+  // pi's teardown event is "session_shutdown"; there is no "session_end". Registering
+  // one made all of this dead code: a resumed or reloaded session kept its heartbeat
+  // running, and the next tick read a property off the ctx pi had just invalidated —
+  // a stale-ctx throw inside a timer, which kills pi outright.
+  //
+  // Only reason "quit" ends the process. The others replace the session inside this
+  // same process, where pi loads a fresh instance of this extension moments later: it
+  // re-joins the same bus (hub.json still names our own live server). So a departing
+  // instance stops its own timers and drops its own lease, but leaves the hub for its
+  // successor, who renews a lease and takes over ownership. shortcut: each replacement
+  // leaks the old closure's 1.5s reaper tick; fine for a few resumes per process.
+  pi.on("session_shutdown", async (event: any) => {
     sessionLive = false;
     if (poll) clearInterval(poll);
-    poll = null;
+    if (heartbeat) clearInterval(heartbeat);
+    poll = heartbeat = null;
     try {
       (ctxRef?.ui as any)?.setStatus?.("");
     } catch {
@@ -1364,13 +1382,12 @@ export default function workspaceSwarmExtension(pi: ExtensionAPI) {
       // We stop being an owner but keep hosting: our own lease is dropped, and
       // the reaper closes the server once the last lease (any harness, any tab)
       // expires. Renewing here would pin the bus to a dead session forever.
-      if (heartbeat) clearInterval(heartbeat);
-      heartbeat = null;
       hub.leases.delete(selfLease());
       // A print run exits the moment this handler returns, so nobody would ever
-      // run the reaper: if we are the last owner, close now instead of leaving a
-      // hub.json pointing at a dead pid. Otherwise keep hosting for the others.
-      if (hub.live().length === 0) {
+      // run the reaper: if we are the last owner and the process is ending, close
+      // now instead of leaving a hub.json pointing at a dead pid. Otherwise keep
+      // hosting — for peers, or for the instance replacing us in this process.
+      if (event?.reason === "quit" && hub.live().length === 0) {
         try {
           fs.unlinkSync(HUB_FILE);
         } catch {

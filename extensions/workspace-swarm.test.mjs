@@ -321,7 +321,7 @@ assert.ok(log.every((m) => typeof m.text === "string" && m.text && m.type === un
 
 // Refcount: the hub outlives its own session while a lease is live, then closes.
 await api(base, "/api/feed?since=0&me=browser:alex&kind=browser");
-await handlers.session_end({}, ctx);
+await handlers.session_shutdown({ reason: "quit" }, ctx);
 await sleep(2200);
 assert.ok(await up(hub.port), "server stays up while another owner holds a lease");
 await api(base, "/api/bye", { id: "browser:alex" });
@@ -332,14 +332,73 @@ assert.equal(fs.existsSync(path.join(process.env.PI_SWARM_DIR, "hub.json")), fal
 assert.deepEqual(notices.filter((m) => m.includes("offline")), [], "session_start must connect cleanly");
 
 // A run that starts the bus alone must tear it down on exit even if the process
-// dies right after session_end (that is what pi -p does).
+// dies right after session_shutdown (that is what pi -p does).
 await handlers.session_start({}, ctx);
 assert.ok(notices.at(-1).includes("this session hosts it"), "second run re-hosts after the bus died");
 const hub2 = JSON.parse(fs.readFileSync(path.join(process.env.PI_SWARM_DIR, "hub.json"), "utf-8"));
 assert.ok(await up(hub2.port), "re-hosted bus is listening");
-await handlers.session_end({}, ctx);
+await handlers.session_shutdown({ reason: "quit" }, ctx);
 assert.equal(fs.existsSync(path.join(process.env.PI_SWARM_DIR, "hub.json")), false, "solo run leaves no hub file behind");
 assert.ok(!(await up(hub2.port)), "solo run closes the port on exit");
+
+// --- a resume must not take pi down ------------------------------------------
+// pi invalidates the ctx of the session it replaces (resume / new / fork / reload),
+// and a stale ctx throws on ANY property read. The instance that just left kept its
+// heartbeat running, and the next tick read ctx.cwd: an uncaught throw inside a timer
+// makes pi exit with "This extension ctx is stale after session replacement...".
+// Teardown lives on "session_shutdown" (pi has no "session_end"), which is what the
+// old handler never heard, so nothing ever stopped those timers.
+const STALE = "This extension ctx is stale after session replacement or reload.";
+const mkCtx = (sessionId) => {
+  const gone = { on: false };
+  const boom = () => {
+    if (gone.on) throw new Error(STALE);
+  };
+  return {
+    hasUI: false,
+    kill: () => (gone.on = true), // pi invalidated this ctx: every read now throws
+    get cwd() {
+      boom();
+      return process.cwd();
+    },
+    get sessionManager() {
+      boom();
+      return { sessionId };
+    },
+    isIdle: () => {
+      boom();
+      return true;
+    },
+    ui: { notify: (m) => notices.push(m), setStatus: () => {} },
+  };
+};
+
+const crashes = [];
+const capture = (e) => crashes.push(String(e?.message || e));
+process.on("uncaughtException", capture);
+process.on("unhandledRejection", capture);
+
+extension(fakePi); // pi loads a fresh instance of the extension for the new session
+const ctx3 = mkCtx("resumehost1");
+await handlers.session_start({}, ctx3);
+assert.ok(notices.at(-1).includes("this session hosts it"), "third run hosts the bus");
+const hub3 = JSON.parse(fs.readFileSync(path.join(process.env.PI_SWARM_DIR, "hub.json"), "utf-8"));
+assert.ok(handlers.session_shutdown, "pi tears a session down with session_shutdown");
+ctx3.kill(); // pi replaced the session: this ctx is now a bomb
+await handlers.session_shutdown({ reason: "resume", targetSessionFile: "x" }, ctx3);
+
+const ctx4 = mkCtx("resumesuccessor1"); // the instance for the session pi resumed
+extension(fakePi);
+await handlers.session_start({}, ctx4);
+assert.ok(await up(hub3.port), "the hub outlives the swap: the successor joins the same bus");
+await sleep(2400); // longer than the 2s heartbeat: a leaked timer would have fired
+assert.deepEqual(crashes, [], "a replaced session must not throw at pi from a timer");
+
+process.off("uncaughtException", capture);
+process.off("unhandledRejection", capture);
+await handlers.session_shutdown({ reason: "quit" }, ctx4); // last lease out closes it
+assert.ok(await waitFor(async () => !(await up(hub3.port)), 12000), "hub closes once nothing renews");
+assert.equal(fs.existsSync(path.join(process.env.PI_SWARM_DIR, "hub.json")), false, "and leaves no hub file");
 
 fs.rmSync(dir, { recursive: true, force: true });
 console.log(`workspace-swarm: all asserts pass (${log.length} messages logged)`);
