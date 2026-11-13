@@ -28,6 +28,8 @@ function boot(sessionId, { tokens = 1000, branch = BRANCH } = {}) {
 	const activeTools = ["bash", "read"];
 	const confirmQueue = [];
 	const confirmCalls = [];
+	const selectQueue = [];
+	const inputQueue = [];
 	const pi = {
 		on: (name, fn) => { events[name] = fn; },
 		registerTool: (t) => { tools[t.name] = t; },
@@ -52,12 +54,14 @@ function boot(sessionId, { tokens = 1000, branch = BRANCH } = {}) {
 				confirmCalls.push({ title, message });
 				return confirmQueue.shift() ?? false; // default to rejection: forgetting to approve must not silently apply
 			},
+			select: async () => selectQueue.shift() ?? "keep",
+			input: async () => inputQueue.shift(),
 		},
 	};
 	mod.default(pi);
 	const memoryFile = path.join(dir, ".pi", "memory", `${sessionId}.json`);
 	const readMemory = () => JSON.parse(fs.readFileSync(memoryFile, "utf8"));
-	return { ctx, tools, commands, events, notifyLog, sent, compactCalls, activeTools, memoryFile, readMemory, confirmQueue, confirmCalls };
+	return { ctx, tools, commands, events, notifyLog, sent, compactCalls, activeTools, memoryFile, readMemory, confirmQueue, confirmCalls, selectQueue, inputQueue };
 }
 const toolCall = (s, name) => s.events.tool_call({ toolName: name }, s.ctx);
 const notified = (s) => s.notifyLog.join("\n---\n");
@@ -69,9 +73,12 @@ assert.equal(s1.activeTools.includes("self_compact"), false, "tools hidden befor
 
 await s1.commands["self-propagate"].handler("on here", s1.ctx);
 await s1.commands["self-propagate"].handler("budget 0.7", s1.ctx);
-await s1.commands["self-propagate"].handler("idle 10", s1.ctx);
-await s1.commands["self-propagate"].handler("keep-awake 5", s1.ctx);
-assert.equal(s1.activeTools.includes("pin_rewrite"), true, "pin_rewrite declared after opt-in");
+await s1.commands["self-propagate"].handler("wake once 10", s1.ctx);
+await s1.commands["self-propagate"].handler("wake every 5", s1.ctx);
+assert.equal(s1.activeTools.includes("goal_set"), true, "goal_set declared after opt-in");
+const memGoal = s1.readMemory();
+assert.equal(memGoal.pinnedContext?.source, "seed", "goal seeded at enable time");
+assert.match(memGoal.pinnedContext?.text ?? "", /also add a watchdog/, "seed goal comes from the anchor");
 
 const upsert = { action: "upsert", key: "goal", title: "Goal", body: "build the daemon" };
 await s1.tools.memory_store.execute("t1", upsert, undefined, undefined, s1.ctx);
@@ -99,7 +106,7 @@ const s2 = boot("sess-a", { tokens: 95000 }); // 95000/70000 = 136% of ceiling
 await s2.events.session_start({}, s2.ctx);
 assert.equal(s2.activeTools.includes("self_compact"), true, "self_compact re-declared after restart");
 assert.equal(s2.activeTools.includes("memory_store"), true, "memory_store re-declared after restart");
-assert.equal(s2.activeTools.includes("pin_rewrite"), true, "pin_rewrite re-declared after restart");
+assert.equal(s2.activeTools.includes("goal_set"), true, "goal_set re-declared after restart");
 assert.match(notified(s2), /restored/i, "restart notice about the queued checkpoint");
 
 // KV survived
@@ -111,6 +118,7 @@ assert.match(list.content[0].text, /arch/, "KV entry 'arch' survived restart");
 const beforeOut = await s2.events.before_agent_start({ systemPrompt: "base" }, s2.ctx);
 assert.match(beforeOut.systemPrompt, /Self-Propagation & Context Protocol/, "static protocol present in head");
 assert.doesNotMatch(beforeOut.systemPrompt, /CRITICAL CONTEXT ALERT/, "volatile budget text kept out of the cached head");
+assert.doesNotMatch(beforeOut.systemPrompt, /No session goal set/, "goal nudge not emitted once a goal exists");
 assert.match(beforeOut.message?.content ?? "", /CRITICAL CONTEXT ALERT/, "over-budget directive delivered as a message after restart");
 assert.equal(s2.readMemory().overBudgetTurns, 1, "grace counter persisted");
 
@@ -119,16 +127,16 @@ await s2.commands["self-propagate"].handler("status", s2.ctx);
 const statusOut = notified(s2);
 assert.match(statusOut, /ENABLED/, "status: enabled restored");
 assert.match(statusOut, /ceiling 70%/, "status bar uses restored ceiling");
-assert.match(statusOut, /keep-awake 5m/, "keep-awake restored");
-assert.match(statusOut, /idle-compact warn 10m/, "idle restored");
-assert.match(statusOut, /floor 1 turn/, "pinned floor restored");
+assert.match(statusOut, /wake every 5m/, "wake-every restored");
+assert.match(statusOut, /wake once 10m/, "wake-once restored");
+assert.match(statusOut, /seeded/, "goal restored");
 assert.match(statusOut, /anchor: e3/, "anchor restored");
 
 // The restored checkpoint blocks tool calls again
 const blocked = await toolCall(s2, "bash");
 assert.equal(blocked?.block, true, "restored pendingCompaction blocks tools after restart");
 assert.match(blocked.reason, /self_compact has already been scheduled/);
-assert.equal((await toolCall(s2, "pin_rewrite"))?.block, true, "pin_rewrite also blocked while compaction is queued");
+assert.equal((await toolCall(s2, "goal_set"))?.block, true, "goal_set also blocked while compaction is queued");
 
 // `compact` no-ops while a compaction is pending (its force path is asserted after agent_end)
 await s2.commands["self-propagate"].handler("compact", s2.ctx);
@@ -137,54 +145,54 @@ assert.match(notified(s2), /already queued/i, "compact reports the queued checkp
 // Pi fires session_before_compact during ctx.compact; check the checkpoint that gets composed
 const sc = await s2.events.session_before_compact({ reason: "manual", preparation: { tokensBefore: 90000 } }, s2.ctx);
 assert.match(sc.compaction.summary, /<pinned_context source="seed"/, "floor clamps keepFirstTurns=0 to a seed pinned from turn 1/anchor");
-assert.match(sc.compaction.summary, /also add a watchdog/, "anchor start: pin seed begins at latest user message");
+assert.match(sc.compaction.summary, /also add a watchdog/, "anchor start: goal seed begins at latest user message");
 assert.doesNotMatch(sc.compaction.summary.split("</pinned_context>")[0], /build the daemon/, "pre-anchor turn not in the seed");
 assert.match(sc.compaction.summary, /<working_memory/, "working memory baked into checkpoint");
 assert.match(sc.compaction.summary, /<compaction_summary>\ndaemon scaffold done/, "agent summary baked in");
 assert.equal(sc.compaction.firstKeptEntryId, "__self_propagate_retain_none__", "zero tail entries retained");
 assert.equal(sc.compaction.details.selfPropagated, true);
-assert.equal(s2.readMemory().pinnedContext?.source, "seed", "seed pin persisted at first compaction");
-assert.match(s2.readMemory().pinnedContext?.text ?? "", /also add a watchdog/, "seed pin holds the anchored turn");
+assert.equal(s2.readMemory().pinnedContext?.source, "seed", "seeded goal persisted at enable time (restored)");
+assert.match(s2.readMemory().pinnedContext?.text ?? "", /also add a watchdog/, "seeded goal holds the anchored turn");
 
-// ---- Pin lifecycle: user override → agent rewrite (reject/approve) → clear → reset ----
+// ---- Goal lifecycle: user override → agent rewrite (reject/approve) → clear → reset ----
 // NB: this whole block relies on pendingCompaction still being queued — session_before_compact
 // returns undefined (and the sc2-sc4 asserts blow up with a TypeError) only after agent_end.
 // Keep it above the "Agent ends" section below.
-await s2.commands["self-propagate"].handler("pin set ALWAYS RUN THE FOO TESTS BEFORE DONE", s2.ctx);
-await s2.commands["self-propagate"].handler("pin show", s2.ctx);
-assert.match(notified(s2), /ALWAYS RUN THE FOO TESTS/, "pin show reflects the user override");
+await s2.commands["self-propagate"].handler("goal set ALWAYS RUN THE FOO TESTS BEFORE DONE", s2.ctx);
+await s2.commands["self-propagate"].handler("goal show", s2.ctx);
+assert.match(notified(s2), /ALWAYS RUN THE FOO TESTS/, "goal show reflects the user override");
 await s2.commands["self-propagate"].handler("status", s2.ctx);
 assert.match(notified(s2), /custom \(user/, "status reports a custom user pin");
 const sc2 = await s2.events.session_before_compact({ reason: "manual", preparation: { tokensBefore: 90000 } }, s2.ctx);
-assert.match(sc2.compaction.summary, /ALWAYS RUN THE FOO TESTS/, "user pin replaces the seed verbatim");
+assert.match(sc2.compaction.summary, /ALWAYS RUN THE FOO TESTS/, "user goal replaces the seed verbatim");
 assert.doesNotMatch(sc2.compaction.summary, /also add a watchdog/, "seed discarded after user override");
-assert.equal(sc2.compaction.details.pinSource, "user", "checkpoint records which pin was baked in");
+assert.equal(sc2.compaction.details.pinSource, "user", "checkpoint records which goal was baked in");
 
 s2.confirmQueue.push(false); // user rejects the agent's proposal
-const rejected = await s2.tools.pin_rewrite.execute("t8", { text: "AGENT MANDATE V2", reason: "goal changed" }, undefined, undefined, s2.ctx);
+const rejected = await s2.tools.goal_set.execute("t8", { text: "AGENT MANDATE V2", reason: "goal changed" }, undefined, undefined, s2.ctx);
 assert.match(rejected.content[0].text, /rejected/i, "rejected rewrite is not applied");
-assert.equal(s2.readMemory().pinnedContext?.text, "ALWAYS RUN THE FOO TESTS BEFORE DONE", "pin unchanged after rejection");
+assert.equal(s2.readMemory().pinnedContext?.text, "ALWAYS RUN THE FOO TESTS BEFORE DONE", "goal unchanged after rejection");
 
 s2.confirmQueue.push(true); // user approves
-const approved = await s2.tools.pin_rewrite.execute("t9", { text: "AGENT MANDATE V2", reason: "goal changed" }, undefined, undefined, s2.ctx);
+const approved = await s2.tools.goal_set.execute("t9", { text: "AGENT MANDATE V2", reason: "goal changed" }, undefined, undefined, s2.ctx);
 assert.equal(approved.details?.applied, true, "approved rewrite reports applied");
 assert.equal(s2.readMemory().pinnedContext?.source, "agent", "agent rewrite persisted with source=agent");
 assert.equal(s2.readMemory().pinnedContext?.text, "AGENT MANDATE V2");
 
-await s2.commands["self-propagate"].handler("pin clear", s2.ctx);
+await s2.commands["self-propagate"].handler("goal clear", s2.ctx);
 const sc3 = await s2.events.session_before_compact({ reason: "manual", preparation: { tokensBefore: 90000 } }, s2.ctx);
-assert.match(sc3.compaction.summary, /<pinned_context status="empty"/, "cleared pin renders the empty marker");
+assert.match(sc3.compaction.summary, /<pinned_context status="empty"/, "cleared goal renders the empty marker");
 
-await s2.commands["self-propagate"].handler("pin reset", s2.ctx);
-assert.equal(s2.readMemory().pinnedContext, null, "pin reset returns to unseeded state");
+await s2.commands["self-propagate"].handler("goal reset", s2.ctx);
+assert.equal(s2.readMemory().pinnedContext, null, "goal reset returns to unseeded state");
 const sc4 = await s2.events.session_before_compact({ reason: "manual", preparation: { tokensBefore: 90000 } }, s2.ctx);
 assert.match(sc4.compaction.summary, /also add a watchdog/, "reset re-seeds from the branch");
 
 // pin here pins the latest user message verbatim
-await s2.commands["self-propagate"].handler("pin here", s2.ctx);
-assert.equal(s2.readMemory().pinnedContext?.source, "user", "pin here stores a user pin");
-assert.match(s2.readMemory().pinnedContext?.text ?? "", /watchdog/, "pin here captured the latest user message");
-assert.match(s2.readMemory().pinnedContext?.text ?? "", /\[Pinned from the current user message\]/, "pin here tags its provenance");
+await s2.commands["self-propagate"].handler("goal here", s2.ctx);
+assert.equal(s2.readMemory().pinnedContext?.source, "user", "goal here stores a user goal");
+assert.match(s2.readMemory().pinnedContext?.text ?? "", /watchdog/, "goal here captured the latest user message");
+assert.match(s2.readMemory().pinnedContext?.text ?? "", /\[Goal pinned from the current user message\]/, "goal here tags its provenance");
 
 // Agent ends: the restored checkpoint actually executes
 await s2.events.agent_end({}, s2.ctx);
@@ -214,8 +222,8 @@ await s4.events.session_start({}, s4.ctx);
 assert.equal(fs.existsSync(path.join(dir, ".pi", "memory", "sess-b.json")), false, "other sessions get no reuse of this session's memory file");
 await s4.commands["self-propagate"].handler("compact", s4.ctx);
 assert.match(notified(s4), /disabled/i, "compact refuses while disabled");
-await s4.commands["self-propagate"].handler("pin", s4.ctx);
-assert.match(notified(s4), /disabled/i, "pin refuses while disabled");
+await s4.commands["self-propagate"].handler("goal", s4.ctx);
+assert.match(notified(s4), /disabled/i, "goal refuses while disabled");
 await s4.commands["self-propagate"].handler("on", s4.ctx);
 const list4 = await s4.tools.memory_store.execute("l4", { action: "list" }, undefined, undefined, s4.ctx);
 assert.match(list4.content[0].text, /empty/i, "fresh session starts with an empty KV store");
@@ -225,7 +233,7 @@ fs.writeFileSync(s2.memoryFile, JSON.stringify({ enabled: true, minPinnedTurns: 
 const s5 = boot("sess-a");
 await s5.events.session_start({}, s5.ctx); // must not crash; malformed pinnedContext loads as unseeded
 await s5.commands["self-propagate"].handler("status", s5.ctx);
-assert.match(notified(s5), /floor 1 turn/, "minPinnedTurns=0 loads as floor 1; malformed pin drops to unseeded");
+assert.match(notified(s5), /floor 1 turn/, "minPinnedTurns=0 loads as floor 1; malformed goal drops to unseeded");
 
 // ---- Phase 6: dead anchor still yields a seed (root fallback, with a warning) ---
 fs.writeFileSync(
@@ -246,7 +254,7 @@ assert.match(deadSc.compaction.summary, /build the daemon/, "dead anchor falls b
 assert.match(notified(s6), /anchor no longer resolves/i, "dead anchor fallback notifies the user");
 assert.equal(s6.readMemory().pinnedContext?.source, "seed", "root fallback persists a real seed, not an empty pin");
 
-// ---- Phase 7: hard grace lock blocks pin_rewrite too ---------------------------
+// ---- Phase 7: hard grace lock blocks goal_set too ----------------------------
 fs.writeFileSync(
 	path.join(dir, ".pi", "memory", "sess-lock.json"),
 	JSON.stringify({ enabled: true, overBudgetTurns: 6 })
@@ -256,8 +264,26 @@ await s7.events.session_start({}, s7.ctx);
 const beforeLock = await s7.events.before_agent_start({ systemPrompt: "base" }, s7.ctx);
 assert.match(beforeLock.message?.content ?? "", /HARD CONTEXT LOCK/, "grace period expired: hard lock directive fires as a message");
 assert.doesNotMatch(beforeLock.systemPrompt, /HARD CONTEXT LOCK/, "head stays static under the hard lock");
-assert.equal((await toolCall(s7, "pin_rewrite"))?.block, true, "pin_rewrite is hard-blocked past the grace lock");
+assert.equal((await toolCall(s7, "goal_set"))?.block, true, "goal_set is hard-blocked past the grace lock");
 assert.equal((await toolCall(s7, "memory_store"))?.block, undefined, "memory_store stays available in the lock");
+
+// ---- Phase 8: enable-time goal flow (edit / skip) ---------------------------
+const s8 = boot("sess-goal");
+s8.selectQueue.push("edit");
+s8.inputQueue.push("EDITED GOAL TEXT");
+await s8.events.session_start({}, s8.ctx);
+await s8.commands["self-propagate"].handler("on here", s8.ctx);
+assert.equal(s8.readMemory().pinnedContext?.text, "EDITED GOAL TEXT", "edit flow stores the edited goal");
+assert.equal(s8.readMemory().pinnedContext?.source, "user", "edited goal is a user goal");
+
+const s9 = boot("sess-skip");
+s9.selectQueue.push("skip");
+await s9.events.session_start({}, s9.ctx);
+await s9.commands["self-propagate"].handler("on here", s9.ctx);
+assert.equal(s9.readMemory().pinnedContext?.text, "", "skip stores a deliberate empty goal");
+assert.equal(s9.readMemory().pinnedContext?.source, "user", "skip is a user decision, not a seed");
+const skipOut = await s9.events.before_agent_start({ systemPrompt: "base" }, s9.ctx);
+assert.doesNotMatch(skipOut.systemPrompt, /No session goal set/, "skip disables the no-goal nudge");
 
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
 const leftovers = fs.readdirSync(path.join(dir, ".pi", "memory")).filter((f) => f.includes(".tmp."));
