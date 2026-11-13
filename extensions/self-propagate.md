@@ -27,4 +27,11 @@
    - Managed by a `globalThis` singleton timer (preventing duplicate loops on `/reload`) that only fires when `enabled && !isBusy && !isCompacting`.
    - When `/keep-awake <minutes>` is active, idle sessions receive a `<keep_awake_tick>` steer message every $X$ minutes.
    - When `/keep-awake` is `off`, if the session sits idle for `15` minutes with context usage $\\ge 25\\%$ of budget, it wakes the agent once (`idleCompactWarned = true`) to run `self_compact({ continueAfter: false })`.
+6. **Durability Across Restarts**
+   - Everything durable lives in `.pi/memory/<sessionId>.json` (atomic tmp-file + rename on every mutation): `enabled`, `budgetRatio`, `keepAwakeMinutes`, `idleCompactMinutes`, `minPinnedTurns`, `anchorEntryId`, the KV store, and — so a restart cannot escape them — the grace counter `overBudgetTurns`, the idle-wake latch `idleCompactWarned`, and any `pendingCompaction` queued by `self_compact`.
+   - On `session_start` the file is reloaded. A checkpoint queued before the process died (between `self_compact` and `agent_end`) is restored, tool calls stay blocked, and it is executed at the next turn end — the agent resumes with the checkpoint summary instead of silently unbounded growth.
+   - Never persisted: `isBusy` / `isCompacting` (an interrupted compaction is always safely retriable) and the idle clock (reset at every `session_start`).
+   - State is cwd-scoped: resuming the session file from a *different* working directory starts from a fresh memory file by design.
+   - A corrupt memory file degrades to safe defaults (disabled, tools hidden), never to a crash or a half-loaded state.
+   - Covered by `extensions/self-propagate.test.mjs` (boot → kill → reboot against the same workspace), wired into `npm test`.
 

@@ -17,11 +17,10 @@
     "url": "git+https://github.com/alexswan10k/pi-extensions.git"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+    "@earendil-works/pi-coding-agent": "*"
   },
   "scripts": {
-    "test": "node extensions/ringfence.test.mjs && node extensions/ringfence.jev.test.mjs && node extensions/ask-jev.test.mjs && node extensions/workspace-swarm.test.mjs && node extensions/workspace-swarm.wake.test.mjs && node extensions/workspace-swarm.failover.test.mjs",
+    "test": "node extensions/ringfence.test.mjs && node extensions/ringfence.jev.test.mjs && node extensions/ask-jev.test.mjs && node extensions/workspace-swarm.test.mjs && node extensions/workspace-swarm.wake.test.mjs && node extensions/workspace-swarm.failover.test.mjs && node extensions/self-propagate.test.mjs",
     "tune": "node extensions/ringfence.jev.tune.mjs"
   }
 }

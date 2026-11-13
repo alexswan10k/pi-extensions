@@ -12,8 +12,8 @@ Lambdasafe's Pi extensions, version-controlled here and installed as an ordinary
 | `extensions/self-propagate.ts` | Opt-in, agent-authored context self-compaction: when the context budget fills, the agent writes its own checkpoint summary and persistent key-value working memory (survives compaction) instead of losing the thread. Tools `self_compact` / `memory_store`, commands `/propagate` (bare = help + current state; also `on [here]`, `off`, `status`, `budget`, `idle`, `help`, with tab-completion of subcommands) and `/keep-awake` (scheduled wake ticks). Turn 1 is always pinned across compactions (hard floor, model cannot pass 0). Writes `.pi/memory/<session>.json` under the session cwd. Architecture in [extensions/self-propagate.md](extensions/self-propagate.md). |
 
 Zero runtime dependencies — all four use only `node:*` plus the host-provided
-`@earendil-works/pi-coding-agent` types and `typebox` (declared in `peerDependencies`;
-self-propagate uses `Type` from `typebox`, everything else is plain objects).
+`@earendil-works/pi-coding-agent` types (declared in `peerDependencies`). Tool schemas
+are plain JSON Schema (what TypeBox emits), so all four also load under bare node.
 
 ## Install
 

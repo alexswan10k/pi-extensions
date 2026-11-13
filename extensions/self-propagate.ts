@@ -1,5 +1,4 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { Type } from "typebox";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
@@ -30,6 +29,11 @@ interface PersistedSessionState {
   minPinnedTurns: number; // Hard floor (default 1) — model cannot pass 0
   anchorEntryId: string | null; // null = session root; set via `/propagate on here`
   kv: Record<string, MemoryEntry>;
+  // Durable across restarts so a restart cannot escape the grace lock or lose a
+  // queued checkpoint. Ephemeral execution flags (isBusy/isCompacting) are NOT here.
+  pendingCompaction: PendingCompaction | null;
+  overBudgetTurns: number;
+  idleCompactWarned: boolean;
 }
 
 interface PendingCompaction {
@@ -44,10 +48,7 @@ interface RuntimeState {
   persisted: PersistedSessionState;
   isBusy: boolean;
   isCompacting: boolean;
-  lastActiveAt: number;
-  idleCompactWarned: boolean;
-  overBudgetTurns: number;
-  pendingCompaction: PendingCompaction | null;
+  lastActiveAt: number; // idle clock: reset at every session start, never persisted
   latestCtx: ExtensionContext | null;
 }
 
@@ -64,13 +65,13 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       minPinnedTurns: 1,
       anchorEntryId: null,
       kv: {},
+      pendingCompaction: null,
+      overBudgetTurns: 0,
+      idleCompactWarned: false,
     },
     isBusy: false,
     isCompacting: false,
     lastActiveAt: Date.now(),
-    idleCompactWarned: false,
-    overBudgetTurns: 0,
-    pendingCompaction: null,
     latestCtx: null,
   };
 
@@ -98,6 +99,17 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     if (fs.existsSync(file)) {
       try {
         const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+        const rawPc = raw.pendingCompaction;
+        const pendingCompaction =
+          rawPc && typeof rawPc.summary === "string" && rawPc.summary.trim()
+            ? {
+                summary: rawPc.summary,
+                keepFirstTurns: Number(rawPc.keepFirstTurns ?? 1) || 1,
+                continueAfter: Boolean(rawPc.continueAfter),
+                nextObjective:
+                  typeof rawPc.nextObjective === "string" ? rawPc.nextObjective : undefined,
+              }
+            : null;
         state.persisted = {
           enabled: Boolean(raw.enabled ?? false),
           budgetRatio: Number(raw.budgetRatio ?? 0.85),
@@ -107,6 +119,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           anchorEntryId:
             typeof raw.anchorEntryId === "string" && raw.anchorEntryId ? raw.anchorEntryId : null,
           kv: raw.kv && typeof raw.kv === "object" ? raw.kv : {},
+          pendingCompaction,
+          overBudgetTurns: Math.max(0, Math.floor(Number(raw.overBudgetTurns) || 0)),
+          idleCompactWarned: Boolean(raw.idleCompactWarned ?? false),
         };
         return;
       } catch {
@@ -121,6 +136,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       minPinnedTurns: 1,
       anchorEntryId: null,
       kv: {},
+      pendingCompaction: null,
+      overBudgetTurns: 0,
+      idleCompactWarned: false,
     };
   }
 
@@ -224,8 +242,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         : "";
     const kvCount = Object.keys(state.persisted.kv).length;
     const graceTag =
-      state.overBudgetTurns > 0
-        ? ` [GRACE ${state.overBudgetTurns}/${GRACE_TURNS_AT_100}]`
+      state.persisted.overBudgetTurns > 0
+        ? ` [GRACE ${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100}]`
         : "";
     ctx.ui?.setStatus?.(
       "self-propagate",
@@ -293,18 +311,19 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
   // --- Trigger Compaction Execution ---
   function executeScheduledCompaction(ctx: ExtensionContext): void {
-    if (!state.pendingCompaction || state.isCompacting) return;
-    const job = state.pendingCompaction;
+    if (!state.persisted.pendingCompaction || state.isCompacting) return;
+    const job = state.persisted.pendingCompaction;
     state.isCompacting = true;
 
     ctx.compact({
       customInstructions: "Self-propagation agent-authored checkpoint.",
       onComplete: () => {
         state.isCompacting = false;
-        state.pendingCompaction = null;
-        state.overBudgetTurns = 0;
-        state.idleCompactWarned = false;
+        state.persisted.pendingCompaction = null;
+        state.persisted.overBudgetTurns = 0;
+        state.persisted.idleCompactWarned = false;
         state.lastActiveAt = Date.now();
+        saveState(ctx);
         updateFooterStatus(ctx);
 
         if (job.continueAfter) {
@@ -323,7 +342,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       },
       onError: (err: unknown) => {
         state.isCompacting = false;
-        state.pendingCompaction = null;
+        state.persisted.pendingCompaction = null;
+        saveState(ctx);
         ctx.ui?.notify?.(
           `Self-compaction failed: ${err instanceof Error ? err.message : String(err)}`,
           "error"
@@ -345,7 +365,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           !state.persisted.enabled ||
           state.isBusy ||
           state.isCompacting ||
-          state.pendingCompaction
+          state.persisted.pendingCompaction
         ) {
           return;
         }
@@ -372,13 +392,14 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         // Mode 2: Idle Compaction Warning (when keep-awake is OFF)
         if (
           state.persisted.idleCompactMinutes > 0 &&
-          !state.idleCompactWarned
+          !state.persisted.idleCompactWarned
         ) {
           const idleTargetMs = state.persisted.idleCompactMinutes * 60_000;
           const { budgetPercent } = getBudgetMetrics(ctx);
           if (idleMs >= idleTargetMs && budgetPercent >= 25) {
-            state.idleCompactWarned = true;
+            state.persisted.idleCompactWarned = true;
             state.lastActiveAt = Date.now();
+            saveState(ctx);
             pi.sendUserMessage(
               `<idle_compaction_notice idle_minutes="${state.persisted.idleCompactMinutes}" context_budget="${budgetPercent}%">\n` +
                 `The session has been inactive for ${state.persisted.idleCompactMinutes} minutes at ${budgetPercent}% context budget.\n` +
@@ -397,35 +418,27 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   ensureGlobalWatchdog();
 
   // --- Register Tools ---
+  // Tool parameters are plain JSON Schema (what TypeBox emits) so this file also
+  // loads under bare node — see extensions/self-propagate.test.mjs.
   pi.registerTool({
     name: "memory_store",
     label: "Working Memory Store",
     description:
       "Manage persistent key-value notes (key, title, body) that survive across all compactions. Keep entries concise.",
-    parameters: Type.Object({
-      action: Type.Union([
-        Type.Literal("upsert"),
-        Type.Literal("delete"),
-        Type.Literal("search"),
-        Type.Literal("list"),
-      ]),
-      key: Type.Optional(
-        Type.String({ description: `Unique slug key (max ${MAX_KEY_LEN} chars)` })
-      ),
-      title: Type.Optional(
-        Type.String({
-          description: `Short searchable header (max ${MAX_TITLE_LEN} chars)`,
-        })
-      ),
-      body: Type.Optional(
-        Type.String({
-          description: `Compact note content (max ${MAX_BODY_LEN} chars)`,
-        })
-      ),
-      query: Type.Optional(
-        Type.String({ description: "Search substring for 'search' action" })
-      ),
-    }),
+    parameters: {
+      type: "object",
+      properties: {
+        action: {
+          type: "string",
+          enum: ["upsert", "delete", "search", "list"],
+        },
+        key: { type: "string", description: `Unique slug key (max ${MAX_KEY_LEN} chars)` },
+        title: { type: "string", description: `Short searchable header (max ${MAX_TITLE_LEN} chars)` },
+        body: { type: "string", description: `Compact note content (max ${MAX_BODY_LEN} chars)` },
+        query: { type: "string", description: "Search substring for 'search' action" },
+      },
+      required: ["action"],
+    },
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (!state.persisted.enabled) {
         return {
@@ -524,42 +537,49 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     label: "Self Compact Context",
     description:
       "Wipe raw conversation history and replace it with your own structured summary, pinned origin turns, and persistent KV working memory.",
-    parameters: Type.Object({
-      summary: Type.String({
-        description:
-          "Comprehensive checkpoint summary of completed work, active file paths, architecture decisions, and remaining tasks. All recent turns will be wiped, so include everything needed to continue.",
-      }),
-      keepFirstTurns: Type.Optional(
-        Type.Number({
+    parameters: {
+      type: "object",
+      properties: {
+        summary: {
+          type: "string",
+          description:
+            "Comprehensive checkpoint summary of completed work, active file paths, architecture decisions, and remaining tasks. All recent turns will be wiped, so include everything needed to continue.",
+        },
+        keepFirstTurns: {
+          type: "number",
           description: `Number of pinned origin turns to preserve verbatim (1-${MAX_PINNED_TURNS}, default 1). The first turn is always pinned; passing 0 is clamped to the floor.`,
-        })
-      ),
-      continueAfter: Type.Boolean({
-        description:
-          "True to automatically resume execution immediately after compaction; False to pause and wait for the user or next wake timer.",
-      }),
-      nextObjective: Type.Optional(
-        Type.String({
+        },
+        continueAfter: {
+          type: "boolean",
+          description:
+            "True to automatically resume execution immediately after compaction; False to pause and wait for the user or next wake timer.",
+        },
+        nextObjective: {
+          type: "string",
           description:
             "When continueAfter is true, the exact immediate action you want to execute first in the fresh context.",
-        })
-      ),
-      memoryUpserts: Type.Optional(
-        Type.Array(
-          Type.Object({
-            key: Type.String(),
-            title: Type.String(),
-            body: Type.String(),
-          }),
-          { description: "Optional batch of KV memory notes to save before compacting." }
-        )
-      ),
-      memoryDeletes: Type.Optional(
-        Type.Array(Type.String(), {
+        },
+        memoryUpserts: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              key: { type: "string" },
+              title: { type: "string" },
+              body: { type: "string" },
+            },
+            required: ["key", "title", "body"],
+          },
+          description: "Optional batch of KV memory notes to save before compacting.",
+        },
+        memoryDeletes: {
+          type: "array",
+          items: { type: "string" },
           description: "Optional list of KV memory keys to delete before compacting.",
-        })
-      ),
-    }),
+        },
+      },
+      required: ["summary", "continueAfter"],
+    },
     async execute(_id, params, _signal, _onUpdate, ctx) {
       if (!state.persisted.enabled) {
         return {
@@ -585,12 +605,13 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       }
       saveState(ctx);
 
-      state.pendingCompaction = {
+      state.persisted.pendingCompaction = {
         summary: params.summary,
         keepFirstTurns: params.keepFirstTurns ?? 1,
         continueAfter: params.continueAfter,
         nextObjective: params.nextObjective,
       };
+      saveState(ctx); // the queued checkpoint must survive a process restart
 
       const errNote =
         memErrors.length > 0 ? ` (Memory warnings: ${memErrors.join("; ")})` : "";
@@ -758,8 +779,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       if (sub === "off") {
         state.persisted.enabled = false;
         state.persisted.keepAwakeMinutes = 0;
-        state.overBudgetTurns = 0;
-        state.pendingCompaction = null;
+        state.persisted.overBudgetTurns = 0;
+        state.persisted.pendingCompaction = null;
         saveState(ctx);
         syncToolVisibility();
         updateFooterStatus(ctx);
@@ -878,19 +899,23 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     state.latestCtx = ctx;
     state.isBusy = false;
-    state.isCompacting = false;
-    state.pendingCompaction = null;
-    state.overBudgetTurns = 0;
-    state.lastActiveAt = Date.now();
-    loadState(ctx);
+    state.isCompacting = false; // never persisted — always false on boot
+    loadState(ctx); // restores durable state, including any queued checkpoint
+    state.lastActiveAt = Date.now(); // idle clock restarts with the session
     syncToolVisibility();
     updateFooterStatus(ctx);
+    if (state.persisted.pendingCompaction) {
+      ctx.ui?.notify?.(
+        "Self-propagation: a self_compact checkpoint queued before the restart was restored and will run at the next turn end.",
+        "info"
+      );
+    }
   });
 
   pi.on("before_agent_start", async (event, ctx) => {
     state.latestCtx = ctx;
     state.isBusy = true;
-    state.idleCompactWarned = false;
+    state.persisted.idleCompactWarned = false;
     state.lastActiveAt = Date.now();
 
     if (!state.persisted.enabled) return;
@@ -899,23 +924,23 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
     let budgetDirective = "";
     if (budgetPercent >= 100) {
-      state.overBudgetTurns += 1;
+      state.persisted.overBudgetTurns += 1;
       const remainingGrace = Math.max(
         0,
-        GRACE_TURNS_AT_100 - state.overBudgetTurns + 1
+        GRACE_TURNS_AT_100 - state.persisted.overBudgetTurns + 1
       );
-      if (state.overBudgetTurns <= GRACE_TURNS_AT_100) {
+      if (state.persisted.overBudgetTurns <= GRACE_TURNS_AT_100) {
         budgetDirective =
-          `\n\n[CRITICAL CONTEXT ALERT — 100% BUDGET REACHED (${tokens}/${budgetCeiling} tokens) — GRACE TURN ${state.overBudgetTurns}/${GRACE_TURNS_AT_100}]\n` +
+          `\n\n[CRITICAL CONTEXT ALERT — 100% BUDGET REACHED (${tokens}/${budgetCeiling} tokens) — GRACE TURN ${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100}]\n` +
           `You MUST wrap up your current thought and call \`self_compact\` within ${remainingGrace} turn(s). ` +
           `After turn ${GRACE_TURNS_AT_100}, all tools except \`self_compact\` and \`memory_store\` will be HARD-LOCKED.`;
       } else {
         budgetDirective =
-          `\n\n[HARD CONTEXT LOCK ENGAGED — GRACE PERIOD EXPIRED (${state.overBudgetTurns}/${GRACE_TURNS_AT_100} turns over 100%)]\n` +
+          `\n\n[HARD CONTEXT LOCK ENGAGED — GRACE PERIOD EXPIRED (${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100} turns over 100%)]\n` +
           `All standard tools are now blocked. You MUST call \`self_compact\` immediately.`;
       }
     } else {
-      state.overBudgetTurns = 0;
+      state.persisted.overBudgetTurns = 0;
       if (budgetPercent >= 75) {
         budgetDirective =
           `\n\n[CONTEXT WARNING: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens). ` +
@@ -927,6 +952,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     }
 
     updateFooterStatus(ctx);
+    saveState(ctx); // persist overBudgetTurns / idleCompactWarned changes
 
     const protocolAppend =
       `\n\n## Self-Propagation & Context Protocol\n` +
@@ -943,7 +969,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   pi.on("tool_call", async (event, ctx) => {
     if (!state.persisted.enabled) return;
 
-    if (state.pendingCompaction && event.toolName !== "memory_store") {
+    if (state.persisted.pendingCompaction && event.toolName !== "memory_store") {
       return {
         block: true,
         reason:
@@ -954,7 +980,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     const { budgetPercent } = getBudgetMetrics(ctx);
     if (
       budgetPercent >= 100 &&
-      state.overBudgetTurns > GRACE_TURNS_AT_100 &&
+      state.persisted.overBudgetTurns > GRACE_TURNS_AT_100 &&
       event.toolName !== "self_compact" &&
       event.toolName !== "memory_store"
     ) {
@@ -974,7 +1000,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
     let tag = `[Context: ${budgetPercent}% (${Math.round(tokens / 1000)}k/${Math.round(budgetCeiling / 1000)}k)]`;
     if (budgetPercent >= 100) {
-      tag = `[CRITICAL 100% CONTEXT (${budgetPercent}%) — Grace Turn ${state.overBudgetTurns}/${GRACE_TURNS_AT_100}: CALL self_compact NOW]`;
+      tag = `[CRITICAL 100% CONTEXT (${budgetPercent}%) — Grace Turn ${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100}: CALL self_compact NOW]`;
     } else if (budgetPercent >= 75) {
       tag = `[WARNING 75%+ CONTEXT (${budgetPercent}%) — Prepare to call self_compact at next checkpoint]`;
     }
@@ -991,13 +1017,13 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
     // If Pi's internal threshold compaction fired without the agent calling self_compact, cancel it
     // so the agent stays in direct control via the 50/75/100% warnings (unless it's a hard API overflow)
-    if (!state.pendingCompaction && event.reason === "threshold") {
+    if (!state.persisted.pendingCompaction && event.reason === "threshold") {
       return { cancel: true };
     }
 
-    if (!state.pendingCompaction) return;
+    if (!state.persisted.pendingCompaction) return;
 
-    const job = state.pendingCompaction;
+    const job = state.persisted.pendingCompaction;
     const originBlock = extractFirstTurnsBlock(ctx, job.keepFirstTurns);
     const memoryBlock = renderWorkingMemoryBlock();
 
@@ -1028,7 +1054,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     state.lastActiveAt = Date.now();
     updateFooterStatus(ctx);
 
-    if (state.persisted.enabled && state.pendingCompaction) {
+    if (state.persisted.enabled && state.persisted.pendingCompaction) {
       executeScheduledCompaction(ctx);
     }
   });
