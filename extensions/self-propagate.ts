@@ -11,7 +11,7 @@ const MAX_TITLE_LEN = 100;
 const MAX_BODY_LEN = 1200;
 const MAX_TOTAL_KV_CHARS = 16000;
 const MAX_PINNED_TURNS = 4;
-const MAX_ORIGIN_TURN_CHARS = 2000;
+const MAX_ORIGIN_TURN_CHARS = 12000;
 const GRACE_TURNS_AT_100 = 5;
 const RETAIN_NONE_SENTINEL = "__self_propagate_retain_none__";
 
@@ -27,6 +27,8 @@ interface PersistedSessionState {
   budgetRatio: number; // Fraction of physical model contextWindow treated as 100% budget (default 0.85)
   keepAwakeMinutes: number; // 0 = disabled
   idleCompactMinutes: number; // Default 15m when keepAwakeMinutes === 0
+  minPinnedTurns: number; // Hard floor (default 1) — model cannot pass 0
+  anchorEntryId: string | null; // null = session root; set via `/propagate on here`
   kv: Record<string, MemoryEntry>;
 }
 
@@ -59,6 +61,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       budgetRatio: 0.85,
       keepAwakeMinutes: 0,
       idleCompactMinutes: 15,
+      minPinnedTurns: 1,
+      anchorEntryId: null,
       kv: {},
     },
     isBusy: false,
@@ -94,6 +98,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           budgetRatio: Number(raw.budgetRatio ?? 0.85),
           keepAwakeMinutes: Number(raw.keepAwakeMinutes ?? 0),
           idleCompactMinutes: Number(raw.idleCompactMinutes ?? 15),
+          minPinnedTurns: Math.max(1, Number(raw.minPinnedTurns ?? 1) || 1),
+          anchorEntryId:
+            typeof raw.anchorEntryId === "string" && raw.anchorEntryId ? raw.anchorEntryId : null,
           kv: raw.kv && typeof raw.kv === "object" ? raw.kv : {},
         };
         return;
@@ -106,6 +113,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       budgetRatio: 0.85,
       keepAwakeMinutes: 0,
       idleCompactMinutes: 15,
+      minPinnedTurns: 1,
+      anchorEntryId: null,
       kv: {},
     };
   }
@@ -219,19 +228,32 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     );
   }
 
-  // --- Extract First N Turns from Branch History ---
+  // --- Extract Pinned Turns from Branch History ---
+  // The floor (minPinnedTurns, default 1) is enforced here, so the agent can ask
+  // for more turns but can never pin fewer than the floor. When anchorEntryId is
+  // set (`/propagate on here`), extraction starts at that entry instead of the
+  // session root.
   function extractFirstTurnsBlock(
     ctx: ExtensionContext,
     keepFirstTurns: number
   ): string {
-    const clamped = Math.max(0, Math.min(MAX_PINNED_TURNS, keepFirstTurns));
-    if (clamped === 0) return "";
+    const minFloor = state.persisted.minPinnedTurns ?? 1;
+    const clamped = Math.max(
+      minFloor,
+      Math.min(MAX_PINNED_TURNS, keepFirstTurns)
+    );
 
     const branch = ctx.sessionManager?.getBranch?.() ?? [];
     const captured: string[] = [];
     let userTurnsSeen = 0;
+    let passedAnchor = !state.persisted.anchorEntryId;
 
     for (const entry of branch) {
+      if (!passedAnchor) {
+        if ((entry as any).id === state.persisted.anchorEntryId) passedAnchor = true;
+        else continue;
+      }
+
       if (entry.type !== "message" || !entry.message) continue;
       const role = entry.message.role;
       if (role !== "user" && role !== "assistant") continue;
@@ -256,12 +278,12 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           rawContent.length > MAX_ORIGIN_TURN_CHARS
             ? `${rawContent.slice(0, MAX_ORIGIN_TURN_CHARS)}...[truncated]`
             : rawContent;
-        captured.push(`[Turn ${userTurnsSeen} - ${role.toUpperCase()}]:\n${snippet}`);
+        captured.push(`[Pinned Turn ${userTurnsSeen} - ${role.toUpperCase()}]:\n${snippet}`);
       }
     }
 
     if (captured.length === 0) return "";
-    return `<pinned_origin_turns count="${clamped}">\n${captured.join("\n\n")}\n</pinned_origin_turns>\n\n`;
+    return `<pinned_origin_turns count="${Math.min(userTurnsSeen, clamped)}">\n${captured.join("\n\n")}\n</pinned_origin_turns>\n\n`;
   }
 
   // --- Trigger Compaction Execution ---
@@ -504,7 +526,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       }),
       keepFirstTurns: Type.Optional(
         Type.Number({
-          description: `Number of initial user/assistant turns from the start of the session to preserve verbatim (0-${MAX_PINNED_TURNS}, default 1).`,
+          description: `Number of pinned origin turns to preserve verbatim (1-${MAX_PINNED_TURNS}, default 1). The first turn is always pinned; passing 0 is clamped to the floor.`,
         })
       ),
       continueAfter: Type.Boolean({
@@ -583,7 +605,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   // --- Commands: /propagate and /keep-awake ---
   pi.registerCommand("propagate", {
     description:
-      "Opt-in or configure self-propagation for this session: /propagate [on|off|status|budget <0.5-0.95>|idle <minutes>]",
+      "Opt-in or configure self-propagation for this session: /propagate [on [here]|off|status|budget <0.3-0.95>|idle <minutes>] — `on here` anchors pinned origin turns to your latest user message instead of the session root",
     handler: async (args, ctx) => {
       state.latestCtx = ctx;
       const parts = (args || "").trim().split(/\s+/);
@@ -591,11 +613,24 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
       if (sub === "on") {
         state.persisted.enabled = true;
+        state.persisted.minPinnedTurns = Math.max(1, state.persisted.minPinnedTurns ?? 1);
+
+        // `/propagate on here` pins from the latest user message in the branch
+        if (parts[1]?.toLowerCase() === "here") {
+          const branch = ctx.sessionManager?.getBranch?.() ?? [];
+          const lastUserEntry = [...branch]
+            .reverse()
+            .find(
+              (e: any) => e.type === "message" && e.message?.role === "user"
+            );
+          state.persisted.anchorEntryId = (lastUserEntry as any)?.id ?? null;
+        }
+
         saveState(ctx);
         syncToolVisibility();
         updateFooterStatus(ctx);
         ctx.ui.notify(
-          `Self-propagation ENABLED for session (Budget ceiling: ${Math.round(state.persisted.budgetRatio * 100)}% of model window).`,
+          `Self-propagation ENABLED (${state.persisted.anchorEntryId ? "anchored to current turn" : "anchored to session start"}, budget ceiling: ${Math.round(state.persisted.budgetRatio * 100)}% of model window).`,
           "info"
         );
         return;
@@ -641,7 +676,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       const { tokens, physicalWindow, budgetCeiling, budgetPercent } =
         getBudgetMetrics(ctx);
       ctx.ui.notify(
-        `Self-Propagate: ${state.persisted.enabled ? "ENABLED" : "DISABLED"} | Usage: ${budgetPercent}% (${tokens}/${budgetCeiling}, model max ${physicalWindow}) | KV: ${Object.keys(state.persisted.kv).length}/${MAX_KV_ENTRIES} | KeepAwake: ${state.persisted.keepAwakeMinutes}m | IdleCompact: ${state.persisted.idleCompactMinutes}m`,
+        `Self-Propagate: ${state.persisted.enabled ? "ENABLED" : "DISABLED"} | Usage: ${budgetPercent}% (${tokens}/${budgetCeiling}, model max ${physicalWindow}) | KV: ${Object.keys(state.persisted.kv).length}/${MAX_KV_ENTRIES} | KeepAwake: ${state.persisted.keepAwakeMinutes}m | IdleCompact: ${state.persisted.idleCompactMinutes}m | MinPinned: ${state.persisted.minPinnedTurns} | Anchor: ${state.persisted.anchorEntryId ? state.persisted.anchorEntryId.slice(0, 8) : "session start"}`,
         "info"
       );
     },
