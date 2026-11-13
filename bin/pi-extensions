@@ -61,7 +61,7 @@ const DESCRIPTIONS = {
   "workspace-swarm": "HTTP group chat / agent bus per workspace",
   "ringfence": "Default-deny guardrail around the workspace",
   "ask-jev": "Yes/no, pick-one and rate judgements from the local LM Studio decision model",
-  "self-propagate": "Agent-authored context self-compaction + KV working memory (/propagate, /keep-awake)",
+  "self-propagate": "Agent-authored context self-compaction + KV working memory (/self-propagate)",
 };
 const PATH_OF = (n) => `extensions/${n}.ts`;
 

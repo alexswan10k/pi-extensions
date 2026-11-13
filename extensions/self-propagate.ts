@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 // --- Constants & Guardrails ---
-const EXTENSION_TOOLS = ["self_compact", "memory_store"] as const;
+const EXTENSION_TOOLS = ["self_compact", "memory_store", "pin_rewrite"] as const;
 const MAX_KV_ENTRIES = 25;
 const MAX_KEY_LEN = 48;
 const MAX_TITLE_LEN = 100;
@@ -11,8 +11,20 @@ const MAX_BODY_LEN = 1200;
 const MAX_TOTAL_KV_CHARS = 16000;
 const MAX_PINNED_TURNS = 4;
 const MAX_ORIGIN_TURN_CHARS = 12000;
+const MAX_PIN_CHARS = 12000;
 const GRACE_TURNS_AT_100 = 5;
 const RETAIN_NONE_SENTINEL = "__self_propagate_retain_none__";
+
+// Static protocol text appended to every system prompt. MUST stay byte-identical
+// across turns and compactions: pi sends a forced prompt as the leading system
+// message on every request (a cache miss whenever it changes), so anything
+// volatile here re-reads the whole prompt every turn. Volatile budget alerts
+// are delivered as a `<self_propagate_budget>` custom message instead.
+const PROTOCOL_STATIC =
+  `\n\n## Self-Propagation & Context Protocol\n` +
+  `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
+  `- The pinned context (the original mandate) is re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a replacement via \`pin_rewrite\` — the user must approve it.\n` +
+  `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps.`;
 
 interface MemoryEntry {
   key: string;
@@ -21,13 +33,20 @@ interface MemoryEntry {
   updatedAt: string;
 }
 
+interface PinnedContext {
+  text: string; // may be "" — an explicit user/agent-approved clear
+  source: "seed" | "user" | "agent";
+  updatedAt: string;
+}
+
 interface PersistedSessionState {
   enabled: boolean;
   budgetRatio: number; // Fraction of physical model contextWindow treated as 100% budget (default 0.85)
   keepAwakeMinutes: number; // 0 = disabled
   idleCompactMinutes: number; // Default 15m when keepAwakeMinutes === 0
-  minPinnedTurns: number; // Hard floor (default 1) — model cannot pass 0
-  anchorEntryId: string | null; // null = session root; set via `/propagate on here`
+  minPinnedTurns: number; // Seed floor for the initial pin (default 1) — applies until pinnedContext is set
+  anchorEntryId: string | null; // null = session root; set via `/self-propagate on here`
+  pinnedContext: PinnedContext | null; // null = not yet seeded; seeded from the branch at first need
   kv: Record<string, MemoryEntry>;
   // Durable across restarts so a restart cannot escape the grace lock or lose a
   // queued checkpoint. Ephemeral execution flags (isBusy/isCompacting) are NOT here.
@@ -64,6 +83,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       idleCompactMinutes: 15,
       minPinnedTurns: 1,
       anchorEntryId: null,
+      pinnedContext: null,
       kv: {},
       pendingCompaction: null,
       overBudgetTurns: 0,
@@ -110,6 +130,20 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
                   typeof rawPc.nextObjective === "string" ? rawPc.nextObjective : undefined,
               }
             : null;
+        const rawPin = raw.pinnedContext;
+        const pinSource: PinnedContext["source"] =
+          rawPin?.source === "user" || rawPin?.source === "agent" || rawPin?.source === "seed"
+            ? rawPin.source
+            : "seed";
+        const pinnedContext =
+          rawPin && typeof rawPin.text === "string"
+            ? {
+                text: scrubContextTags(rawPin.text.slice(0, MAX_PIN_CHARS)),
+                source: pinSource,
+                updatedAt:
+                  typeof rawPin.updatedAt === "string" ? rawPin.updatedAt : new Date().toISOString(),
+              }
+            : null;
         state.persisted = {
           enabled: Boolean(raw.enabled ?? false),
           budgetRatio: Number(raw.budgetRatio ?? 0.85),
@@ -118,6 +152,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           minPinnedTurns: Math.max(1, Number(raw.minPinnedTurns ?? 1) || 1),
           anchorEntryId:
             typeof raw.anchorEntryId === "string" && raw.anchorEntryId ? raw.anchorEntryId : null,
+          pinnedContext,
           kv: raw.kv && typeof raw.kv === "object" ? raw.kv : {},
           pendingCompaction,
           overBudgetTurns: Math.max(0, Math.floor(Number(raw.overBudgetTurns) || 0)),
@@ -135,6 +170,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       idleCompactMinutes: 15,
       minPinnedTurns: 1,
       anchorEntryId: null,
+      pinnedContext: null,
       kv: {},
       pendingCompaction: null,
       overBudgetTurns: 0,
@@ -197,14 +233,17 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   }
 
   function renderWorkingMemoryBlock(): string {
-    const entries = Object.values(state.persisted.kv);
+    const entries = Object.values(state.persisted.kv).filter(
+      (e): e is MemoryEntry =>
+        !!e && typeof e.key === "string" && typeof e.title === "string" && typeof e.body === "string"
+    );
     if (entries.length === 0) {
       return "<working_memory status=\"empty\" />";
     }
     const items = entries
       .map(
         (e) =>
-          `  <note key="${e.key}" title="${e.title.replace(/"/g, "'")}">\n    ${e.body}\n  </note>`
+          `  <note key="${e.key.replace(/"/g, "'")}" title="${e.title.replace(/"/g, "'")}">\n    ${scrubContextTags(e.body)}\n  </note>`
       )
       .join("\n");
     return `<working_memory count="${entries.length}">\n${items}\n</working_memory>`;
@@ -251,62 +290,148 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     );
   }
 
-  // --- Extract Pinned Turns from Branch History ---
-  // The floor (minPinnedTurns, default 1) is enforced here, so the agent can ask
-  // for more turns but can never pin fewer than the floor. When anchorEntryId is
-  // set (`/propagate on here`), extraction starts at that entry instead of the
-  // session root.
-  function extractFirstTurnsBlock(
+  // --- Pinned Context (the original mandate, re-baked into every compaction) ---
+  // The pin is a persisted document in .pi/memory/<session>.json, not a re-extraction
+  // from the branch. It is seeded once, lazily, at the first compaction (or first pin
+  // need) — from the session root by default, from the anchor set via
+  // `/self-propagate on here`, falling back to the root when the anchor no longer lies
+  // on the branch. It is re-injected verbatim into every self-propagate checkpoint.
+  // Rewriting it requires an explicit user action (`/self-propagate pin set|clear|reset|here`)
+  // or a `pin_rewrite` tool call approved by the user — the floor cannot be edited away
+  // silently. `minPinnedTurns` is the seed floor only; it does not override a
+  // deliberately cleared or rewritten pin.
+
+  // Agent/user content containing tag-looking sequences must not forge the
+  // checkpoint structure (<pinned_context>…</pinned_context> etc.). Strip the
+  // leading angle bracket from any closing/opening tag the checkpoint uses.
+  function scrubContextTags(text: string): string {
+    return text.replace(
+      /<(\/?)(pinned_context|working_memory|compaction_summary|note|idle_compaction_notice|keep_awake_tick|force_compact|pin_rewrite_request|self_propagation_resume)\b/gi,
+      "[$1$2"
+    );
+  }
+
+  function errMsg(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
+  }
+
+  function extractPinSeed(
     ctx: ExtensionContext,
     keepFirstTurns: number
-  ): string {
+  ): { text: string; fellBack: boolean } {
     const minFloor = state.persisted.minPinnedTurns ?? 1;
+    const raw = Number(keepFirstTurns);
+    const requested = Number.isFinite(raw) ? raw : 1;
     const clamped = Math.max(
       minFloor,
-      Math.min(MAX_PINNED_TURNS, keepFirstTurns)
+      Math.min(MAX_PINNED_TURNS, requested)
     );
 
     const branch = ctx.sessionManager?.getBranch?.() ?? [];
-    const captured: string[] = [];
-    let userTurnsSeen = 0;
-    let passedAnchor = !state.persisted.anchorEntryId;
 
-    for (const entry of branch) {
-      if (!passedAnchor) {
-        if ((entry as any).id === state.persisted.anchorEntryId) passedAnchor = true;
-        else continue;
-      }
+    const capture = (anchor: string | null): string => {
+      const captured: string[] = [];
+      let userTurnsSeen = 0;
+      let passedAnchor = !anchor;
 
-      if (entry.type !== "message" || !entry.message) continue;
-      const role = entry.message.role;
-      if (role !== "user" && role !== "assistant") continue;
+      for (const entry of branch) {
+        if (!passedAnchor) {
+          if ((entry as any).id === anchor) passedAnchor = true;
+          else continue;
+        }
 
-      if (role === "user") {
-        userTurnsSeen++;
-        if (userTurnsSeen > clamped) break;
-      }
+        if (entry.type !== "message" || !entry.message) continue;
+        const role = entry.message.role;
+        if (role !== "user" && role !== "assistant") continue;
 
-      const rawContent =
-        typeof entry.message.content === "string"
-          ? entry.message.content
-          : Array.isArray(entry.message.content)
+        if (role === "user") {
+          userTurnsSeen++;
+          if (userTurnsSeen > clamped) break;
+        }
+
+        const rawContent =
+          typeof entry.message.content === "string"
             ? entry.message.content
-                .filter((b: any) => b.type === "text")
-                .map((b: any) => b.text)
-                .join("\n")
-            : "";
+            : Array.isArray(entry.message.content)
+              ? entry.message.content
+                  .filter((b: any) => b.type === "text")
+                  .map((b: any) => b.text)
+                  .join("\n")
+              : "";
 
-      if (rawContent.trim()) {
-        const snippet =
-          rawContent.length > MAX_ORIGIN_TURN_CHARS
-            ? `${rawContent.slice(0, MAX_ORIGIN_TURN_CHARS)}...[truncated]`
-            : rawContent;
-        captured.push(`[Pinned Turn ${userTurnsSeen} - ${role.toUpperCase()}]:\n${snippet}`);
+        if (rawContent.trim()) {
+          const snippet =
+            rawContent.length > MAX_ORIGIN_TURN_CHARS
+              ? `${rawContent.slice(0, MAX_ORIGIN_TURN_CHARS)}...[truncated]`
+              : rawContent;
+          captured.push(`[Pinned Turn ${userTurnsSeen} - ${role.toUpperCase()}]:\n${snippet}`);
+        }
       }
-    }
 
-    if (captured.length === 0) return "";
-    return `<pinned_origin_turns count="${Math.min(userTurnsSeen, clamped)}">\n${captured.join("\n\n")}\n</pinned_origin_turns>\n\n`;
+      return captured.join("\n\n");
+    };
+
+    const anchored = capture(state.persisted.anchorEntryId);
+    // A dead/absent anchor must never persist a silently empty pin.
+    if (anchored.trim() || !state.persisted.anchorEntryId) {
+      return { text: anchored.slice(0, MAX_PIN_CHARS), fellBack: false };
+    }
+    const text = capture(null);
+    return { text: text.slice(0, MAX_PIN_CHARS), fellBack: true };
+  }
+
+  function ensurePinnedContext(ctx: ExtensionContext, keepFirstTurns = 1): PinnedContext {
+    if (state.persisted.pinnedContext) return state.persisted.pinnedContext;
+    const seed = extractPinSeed(ctx, keepFirstTurns);
+    if (seed.fellBack) {
+      ctx.ui?.notify?.(
+        "Pin seed: the anchor no longer resolves on this branch — seeded from the session root instead.",
+        "warning"
+      );
+    }
+    const pinnedContext: PinnedContext = {
+      text: scrubContextTags(seed.text),
+      source: "seed",
+      updatedAt: new Date().toISOString(),
+    };
+    state.persisted.pinnedContext = pinnedContext;
+    saveState(ctx);
+    return pinnedContext;
+  }
+
+  function renderPinnedContextBlock(ctx: ExtensionContext, keepFirstTurns: number): string {
+    const pin = ensurePinnedContext(ctx, keepFirstTurns);
+    if (!pin.text.trim()) {
+      return `<pinned_context status="empty" source="${pin.source}" />\n\n`;
+    }
+    return `<pinned_context source="${pin.source}" updated="${pin.updatedAt}">\n${pin.text}\n</pinned_context>\n\n`;
+  }
+
+  function setPinnedContext(text: string, source: "user" | "agent"): void {
+    state.persisted.pinnedContext = {
+      text: scrubContextTags(text).slice(0, MAX_PIN_CHARS),
+      source,
+      updatedAt: new Date().toISOString(),
+    };
+  }
+
+  function latestUserMessageText(ctx: ExtensionContext): string | null {
+    const branch = ctx.sessionManager?.getBranch?.() ?? [];
+    const lastUserEntry = [...branch]
+      .reverse()
+      .find((e: any) => e.type === "message" && e.message?.role === "user");
+    const content = (lastUserEntry as any)?.message?.content;
+    if (!content) return null;
+    const text =
+      typeof content === "string"
+        ? content
+        : Array.isArray(content)
+          ? content
+              .filter((b: any) => b.type === "text")
+              .map((b: any) => b.text)
+              .join("\n")
+          : "";
+    return text.trim() ? text : null;
   }
 
   // --- Trigger Compaction Execution ---
@@ -536,7 +661,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "self_compact",
     label: "Self Compact Context",
     description:
-      "Wipe raw conversation history and replace it with your own structured summary, pinned origin turns, and persistent KV working memory.",
+      "Wipe raw conversation history and replace it with your own structured summary, the pinned context (the original mandate, re-baked verbatim), and persistent KV working memory.",
     parameters: {
       type: "object",
       properties: {
@@ -547,7 +672,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         },
         keepFirstTurns: {
           type: "number",
-          description: `Number of pinned origin turns to preserve verbatim (1-${MAX_PINNED_TURNS}, default 1). The first turn is always pinned; passing 0 is clamped to the floor.`,
+          description: `Number of turns to seed the pinned context with when none exists yet (1-${MAX_PINNED_TURNS}, default 1). Only used at seed time; once a pin exists it is re-used verbatim. Changing the pin itself requires the user (\`/self-propagate pin\`) or a user-approved \`pin_rewrite\`.`,
         },
         continueAfter: {
           type: "boolean",
@@ -607,7 +732,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
       state.persisted.pendingCompaction = {
         summary: params.summary,
-        keepFirstTurns: params.keepFirstTurns ?? 1,
+        keepFirstTurns: Number.isFinite(Number(params.keepFirstTurns))
+          ? Number(params.keepFirstTurns)
+          : 1, // NaN/undefined → safe default (seed floor applies at render time)
         continueAfter: params.continueAfter,
         nextObjective: params.nextObjective,
       };
@@ -628,14 +755,97 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     },
   });
 
-  // --- Commands: /propagate and /keep-awake ---
+  pi.registerTool({
+    name: "pin_rewrite",
+    label: "Rewrite Pinned Context",
+    description:
+      "Propose a replacement for the pinned context — the original mandate re-injected verbatim into every self-propagate checkpoint. The user is asked to approve the new text; if they reject it, nothing changes. Use this only when the session's goal has genuinely changed, not to shed inconvenient constraints. Takes effect at the next compaction (call self_compact to apply it now).",
+    parameters: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description: `The full replacement pinned context (max ${MAX_PIN_CHARS} chars). Pass an empty string to clear the pin entirely — the user still has to approve that. Write it as instructions you would want a fresh instance of you to obey.`,
+        },
+        reason: {
+          type: "string",
+          description: "Why the pin should change. Shown to the user in the approval dialog.",
+        },
+      },
+      required: ["text", "reason"],
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!state.persisted.enabled) {
+        return {
+          content: [{ type: "text", text: "Self-propagation is disabled." }],
+          details: {},
+        };
+      }
+
+      const text = String(params.text ?? "").trim();
+      const reason = String(params.reason ?? "").trim();
+      if (text.length > MAX_PIN_CHARS) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Pinned context too large (${text.length}/${MAX_PIN_CHARS} chars). Trim it.`,
+            },
+          ],
+          details: {},
+        };
+      }
+
+      const preview = text
+        ? text.length > 2000
+          ? `${text.slice(0, 2000)}...[${text.length - 2000} more chars]`
+          : text
+        : "(empty — the pin will be CLEARED; no mandate is re-injected after compactions)";
+      const message = `Reason: ${reason || "(none given)"}\n\nNew pinned context (${text.length} chars):\n\n${preview}`;
+
+      let approved = false;
+      try {
+        approved = (await ctx.ui?.confirm?.("Rewrite pinned context?", message)) === true;
+      } catch {
+        approved = false;
+      }
+      if (!approved) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Pin rewrite rejected or unavailable — the pinned context is unchanged. Do not retry without new user input.",
+            },
+          ],
+          details: { applied: false },
+        };
+      }
+
+      setPinnedContext(text, "agent");
+      saveState(ctx);
+      return {
+        content: [
+          {
+            type: "text",
+            text: "Pinned context rewritten (user-approved). It takes effect at the next compaction — call self_compact, or the user can run /self-propagate compact, to apply it now.",
+          },
+        ],
+        details: { applied: true },
+      };
+    },
+  });
+
+  // --- Commands: /self-propagate ---
   const PROPAGATE_SUBS = [
     { value: "on", description: "Enable self-propagation for this session" },
-    { value: "on here", description: "Enable, anchoring pinned origin turns to your latest user message" },
+    { value: "on here", description: "Enable, anchoring the pinned-context seed to your latest user message" },
     { value: "off", description: "Disable; clears keep-awake and any queued compaction" },
-    { value: "status", description: "Full state: budget bar, pinned floor, anchor, KV store, timers" },
+    { value: "status", description: "Full state: budget bar, pin, anchor, KV store, timers" },
     { value: "budget", description: "Set/show budget ceiling as fraction of model window (0.3–0.95, default 0.85)" },
     { value: "idle", description: "Set/show idle-compaction warning minutes (0 = off, default 15)" },
+    { value: "keep-awake", description: "Wake tick every N minutes of inactivity, or `off` to disable" },
+    { value: "pin", description: "Manage the pinned context: show | set <text> | clear | reset | here | draft" },
+    { value: "compact", description: "Ask the agent to compact right now" },
     { value: "help", description: "Show this help" },
   ] as const;
 
@@ -658,8 +868,14 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     const { tokens, physicalWindow, budgetCeiling, budgetPercent } =
       getBudgetMetrics(ctx);
     const kv = Object.keys(state.persisted.kv).length;
+    const pin = state.persisted.pinnedContext;
+    const pinDesc = pin
+      ? pin.text.trim()
+        ? `${pin.source === "seed" ? "seeded" : `custom (${pin.source})`}, ${pin.text.length} chars, updated ${pin.updatedAt.slice(0, 10)}`
+        : `CLEARED (${pin.source}, ${pin.updatedAt.slice(0, 10)})`
+      : `floor ${state.persisted.minPinnedTurns} turn(s), seed pending`;
     const anchor = state.persisted.anchorEntryId
-      ? `${state.persisted.anchorEntryId.slice(0, 12)}… (set via /propagate on here)`
+      ? `${state.persisted.anchorEntryId.slice(0, 12)}… (set via /self-propagate on here)`
       : "session start (default)";
     const tier =
       budgetPercent >= 100
@@ -673,7 +889,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       "Self-Propagate",
       `  State    ${state.persisted.enabled ? "ENABLED" : "DISABLED"}`,
       `  Budget   ${renderBudgetBar(budgetPercent)} ${budgetPercent}%  (${tokens}/${Math.round(budgetCeiling)} tokens; window ${physicalWindow}, ceiling ${Math.round(state.persisted.budgetRatio * 100)}%) — ${tier}`,
-      `  Pinned   floor ${state.persisted.minPinnedTurns} turn(s) | anchor: ${anchor}`,
+      `  Pinned   ${pinDesc} | anchor: ${anchor}`,
       `  KV       ${kv}/${MAX_KV_ENTRIES} notes | file: .pi/memory/${currentSessionId(ctx).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`,
       `  Timers   keep-awake ${state.persisted.keepAwakeMinutes > 0 ? `${state.persisted.keepAwakeMinutes}m` : "off"} | idle-compact warn ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"}`,
     ].join("\n");
@@ -684,32 +900,47 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       "Self-Propagate — contextual self-compaction for long sessions",
       "",
       "When the budget fills, the agent writes its own checkpoint (summary + pinned",
-      "origin turns + KV working memory), wipes raw history, and resumes. Opt-in per",
+      "context + KV working memory), wipes raw history, and resumes. Opt-in per",
       "session; nothing is sent anywhere and nothing changes when disabled.",
       "",
-      "Usage: /propagate [subcommand]",
+      "Usage: /self-propagate [subcommand]",
       "",
-      "  on [here]          Enable. `here` anchors pinned origin turns to your latest",
-      "                     user message (for mid-conversation); default pins from the",
-      "                     session root. Turn 1 is always pinned (hard floor).",
+      "  on [here]          Enable. `here` seeds the initial pin from your latest",
+      "                     user message (for mid-conversation); default seeds from",
+      "                     the session root. The seed floor is 1 turn.",
       "  off                Disable; clears keep-awake, pending compaction, grace count.",
-      "  status             Full state: budget bar, pinned floor, anchor, KV, timers.",
+      "  status             Full state: budget bar, pin, anchor, KV, timers.",
       "  budget <0.3-0.95>  Effective ceiling as fraction of model window (default 0.85).",
       "                     No argument prints the current value.",
       "  idle <minutes>     Warn + poke the agent when idle this long at ≥25% budget",
       "                     (0 = off, default 15). No argument prints the current value.",
-      "  help               This help (also the default for bare /propagate).",
+      "  keep-awake <minutes|off>",
+      "                     Wake tick every N minutes of inactivity (auto-enables).",
+      "  pin [show]         Show the pinned context (the mandate re-baked into every",
+      "                     checkpoint). If unset, it is seeded at the next compaction.",
+      "  pin set <text>     Replace the pinned context with <text>.",
+      "  pin clear          Clear the pin — no mandate re-injected after compaction.",
+      "  pin reset          Discard the custom pin; re-seed from the branch next compaction.",
+      "  pin here           Pin the latest user message as the pinned context.",
+      "  pin draft          Ask the agent to propose a new pin; you approve before it lands.",
+      "  compact            Ask the agent to compact right now.",
+      "  help               This help (also the default for bare /self-propagate).",
+      "",
+      "Notes",
+      "  Pin edits take effect at the NEXT compaction; `compact` applies them now.",
+      "  Writing the pin file itself never enters context and never busts the cache.",
+      "  The agent can propose pin changes via the pin_rewrite tool, but they",
+      "  apply only with your approval.",
       "",
       "Related tooling",
-      "  /keep-awake <minutes|off>   Wake tick every N minutes of inactivity.",
-      "  self_compact, memory_store   Tools, only declared while enabled.",
-      "  .pi/memory/<session>.json    KV notes + flags; survives /reload and resume.",
+      "  self_compact, memory_store, pin_rewrite   Tools, only declared while enabled.",
+      "  .pi/memory/<session>.json                 KV notes + pin + flags; survives /reload and resume.",
     ].join("\n");
   }
 
-  pi.registerCommand("propagate", {
+  pi.registerCommand("self-propagate", {
     description:
-      "Self-propagation for long sessions: /propagate help | on [here] | off | status | budget <0.3-0.95> | idle <minutes>",
+      "Self-propagation for long sessions: /self-propagate help | on [here] | off | status | budget <0.3-0.95> | idle <minutes> | keep-awake <minutes|off> | pin <show|set|clear|reset|here|draft> | compact",
     getArgumentCompletions: (prefix: string) => {
       const lower = prefix.toLowerCase();
       const firstSpace = lower.indexOf(" ");
@@ -721,21 +952,37 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       }
       const first = lower.slice(0, firstSpace).trim();
       const rest = lower.slice(firstSpace + 1);
+      // pi's autocomplete replaces the WHOLE argument with `value`, so nested
+      // values must carry the `<subcommand> ` prefix ("idle 5", not "5").
       const suggest = (values: string[], describe: (v: string) => string) =>
         values
           .filter((v) => v.startsWith(rest))
-          .map((v) => ({ value: v, label: v, description: describe(v) }));
+          .map((v) => ({ value: `${first} ${v}`, label: v, description: describe(v) }));
       if (first === "on")
-        return suggest(["here"], () => "Anchor pinned origin turns to your latest user message");
+        return suggest(["here"], () => "Seed the pin from your latest user message");
       if (first === "budget")
         return suggest(["0.5", "0.7", "0.85", "0.9"], (v) => `Ceiling ${Math.round(parseFloat(v) * 100)}% of model window`);
       if (first === "idle")
         return suggest(["0", "5", "10", "15", "30"], (v) => (v === "0" ? "Disable idle warning" : `Warn after ${v}m idle`));
+      if (first === "keep-awake")
+        return suggest(["off", "5", "10", "15", "30"], (v) => (v === "off" ? "Disable keep-awake" : `Wake after ${v}m idle`));
+      if (first === "pin") {
+        const PIN_HELP: Record<string, string> = {
+          show: "Show the pinned context",
+          set: "Replace the pinned context with <text>",
+          clear: "Clear the pin (no mandate re-injected)",
+          reset: "Discard custom pin; re-seed from the branch",
+          here: "Pin the latest user message",
+          draft: "Agent proposes a new pin; you approve",
+        };
+        return suggest(["show", "set", "clear", "reset", "here", "draft"], (v) => PIN_HELP[v] ?? v);
+      }
       return null;
     },
     handler: async (args, ctx) => {
       state.latestCtx = ctx;
-      const parts = (args || "").trim().split(/\s+/).filter(Boolean);
+      const rawArgs = args || "";
+      const parts = rawArgs.trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] || "help").toLowerCase();
 
       if (sub === "help" || sub === "h" || sub === "?") {
@@ -747,7 +994,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         const option = parts[1]?.toLowerCase();
         if (option && option !== "here") {
           ctx.ui.notify(
-            `Unknown option '${parts[1]}'. Did you mean \`/propagate on here\`?`,
+            `Unknown option '${parts[1]}'. Did you mean \`/self-propagate on here\`?`,
             "warning"
           );
           return;
@@ -755,7 +1002,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         state.persisted.enabled = true;
         state.persisted.minPinnedTurns = Math.max(1, state.persisted.minPinnedTurns ?? 1);
 
-        // `/propagate on here` pins from the latest user message in the branch
+        // `/self-propagate on here` pins from the latest user message in the branch
+        let seedNote = "";
         if (option === "here") {
           const branch = ctx.sessionManager?.getBranch?.() ?? [];
           const lastUserEntry = [...branch]
@@ -764,13 +1012,25 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
               (e: any) => e.type === "message" && e.message?.role === "user"
             );
           state.persisted.anchorEntryId = (lastUserEntry as any)?.id ?? null;
+          // Anchoring only affects the SEED. If an untouched seed pin exists,
+          // drop it so it re-seeds from the new anchor at the next compaction.
+          // A user/agent-rewritten pin is never touched silently.
+          const pin = state.persisted.pinnedContext;
+          if (!pin) {
+            seedNote = "";
+          } else if (pin.source === "seed") {
+            state.persisted.pinnedContext = null;
+            seedNote = " The existing seed pin will be re-created from this turn at the next compaction.";
+          } else {
+            seedNote = " Existing custom pin kept — run /self-propagate pin reset to re-seed from this turn instead.";
+          }
         }
 
         saveState(ctx);
         syncToolVisibility();
         updateFooterStatus(ctx);
         ctx.ui.notify(
-          `Self-propagation ENABLED (${state.persisted.anchorEntryId ? "anchor: current turn" : "anchor: session start"}, ceiling ${Math.round(state.persisted.budgetRatio * 100)}% of model window). /propagate status for details, /propagate help for usage.`,
+          `Self-propagation ENABLED (${state.persisted.anchorEntryId ? "anchor: current turn" : "anchor: session start"}, ceiling ${Math.round(state.persisted.budgetRatio * 100)}% of model window). /self-propagate status for details, /self-propagate help for usage.${seedNote}`,
           "info"
         );
         return;
@@ -784,14 +1044,14 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         saveState(ctx);
         syncToolVisibility();
         updateFooterStatus(ctx);
-        ctx.ui.notify("Self-propagation DISABLED for this session. /propagate on to re-enable.", "info");
+        ctx.ui.notify("Self-propagation DISABLED for this session. /self-propagate on to re-enable.", "info");
         return;
       }
 
       if (sub === "budget") {
         if (!parts[1]) {
           ctx.ui.notify(
-            `Budget ceiling is ${Math.round(state.persisted.budgetRatio * 100)}% of model window. Set it with /propagate budget <0.3-0.95> (e.g. 0.85).`,
+            `Budget ceiling is ${Math.round(state.persisted.budgetRatio * 100)}% of model window. Set it with /self-propagate budget <0.3-0.95> (e.g. 0.85).`,
             "info"
           );
           return;
@@ -811,7 +1071,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       if (sub === "idle") {
         if (!parts[1]) {
           ctx.ui.notify(
-            `Idle compaction warning is ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"}. Set it with /propagate idle <minutes> (0 = off).`,
+            `Idle compaction warning is ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"}. Set it with /self-propagate idle <minutes> (0 = off).`,
             "info"
           );
           return;
@@ -827,70 +1087,194 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         return;
       }
 
+      if (sub === "keep-awake") {
+        const arg = (parts[1] || "").trim().toLowerCase();
+        if (!arg) {
+          ctx.ui.notify(
+            `Keep-awake is currently ${state.persisted.keepAwakeMinutes > 0 ? `ON (${state.persisted.keepAwakeMinutes}m)` : "OFF"}. Set it with /self-propagate keep-awake <minutes|off>.`,
+            "info"
+          );
+          return;
+        }
+        if (arg === "off" || arg === "0") {
+          state.persisted.keepAwakeMinutes = 0;
+          saveState(ctx);
+          updateFooterStatus(ctx);
+          ctx.ui.notify("Keep-awake timer disabled.", "info");
+          return;
+        }
+        const mins = parseFloat(arg);
+        if (isNaN(mins) || mins <= 0) {
+          ctx.ui.notify("Usage: /self-propagate keep-awake <minutes|off>", "warning");
+          return;
+        }
+        state.persisted.enabled = true; // Auto-enable propagation if keep-awake is turned on
+        state.persisted.keepAwakeMinutes = mins;
+        state.lastActiveAt = Date.now();
+        saveState(ctx);
+        syncToolVisibility();
+        updateFooterStatus(ctx);
+        ctx.ui.notify(
+          `Keep-awake enabled: session will wake after ${mins}m of inactivity (Self-propagation enabled).`,
+          "info"
+        );
+        return;
+      }
+
+      if (sub === "pin") {
+        if (!state.persisted.enabled) {
+          ctx.ui.notify("Self-propagation is disabled for this session.", "warning");
+          return;
+        }
+        const action = (parts[1] || "show").toLowerCase();
+        // Preserve the mandate's internal formatting: take everything after `pin set` verbatim
+        const rest =
+          action === "set"
+            ? rawArgs.replace(/^\s*pin\s+set\s*/i, "").trim()
+            : parts.slice(2).join(" ").trim();
+        const pin = state.persisted.pinnedContext;
+        const seedDesc = state.persisted.anchorEntryId ? "the anchor (current turn)" : "Turn 1";
+
+        if (action === "show" || action === "s") {
+          if (!pin) {
+            ctx.ui.notify(
+              `Pin not yet seeded — the first checkpoint will seed it from ${seedDesc} (floor ${state.persisted.minPinnedTurns} turn). /self-propagate pin here to pin the current user message instead.`,
+              "info"
+            );
+            return;
+          }
+          if (!pin.text.trim()) {
+            ctx.ui.notify(
+              `Pinned context is CLEARED (${pin.source}, ${pin.updatedAt}). No mandate will be re-injected after compaction. /self-propagate pin reset to re-seed from ${seedDesc}.`,
+              "warning"
+            );
+            return;
+          }
+          const body =
+            pin.text.length > 3000
+              ? `${pin.text.slice(0, 3000)}\n...[truncated — ${pin.text.length} chars total]`
+              : pin.text;
+          ctx.ui.notify(
+            `Pinned context (${pin.source}, ${pin.updatedAt}, ${pin.text.length} chars):\n\n${body}`,
+            "info"
+          );
+          return;
+        }
+
+        if (action === "set") {
+          if (!rest) {
+            ctx.ui.notify(
+              "Usage: /self-propagate pin set <text>. Applies at the next compaction; run /self-propagate compact to apply now.",
+              "warning"
+            );
+            return;
+          }
+          if (rest.length > MAX_PIN_CHARS) {
+            ctx.ui.notify(`Pinned context too large (${rest.length}/${MAX_PIN_CHARS} chars).`, "warning");
+            return;
+          }
+          setPinnedContext(rest, "user");
+          saveState(ctx);
+          ctx.ui.notify(
+            `Pinned context set (user, ${rest.length} chars). Applies at the next compaction — /self-propagate compact to apply now.`,
+            "info"
+          );
+          return;
+        }
+
+        if (action === "clear") {
+          setPinnedContext("", "user");
+          saveState(ctx);
+          ctx.ui.notify(
+            "Pinned context CLEARED — no mandate will be re-injected after compaction. /self-propagate pin reset to re-seed.",
+            "warning"
+          );
+          return;
+        }
+
+        if (action === "reset") {
+          state.persisted.pinnedContext = null;
+          saveState(ctx);
+          ctx.ui.notify(
+            `Pinned context reset — re-seeded from ${seedDesc} at the next compaction (floor ${state.persisted.minPinnedTurns} turn).`,
+            "info"
+          );
+          return;
+        }
+
+        if (action === "here") {
+          const msg = latestUserMessageText(ctx);
+          if (!msg) {
+            ctx.ui.notify("No user message found in this branch to pin.", "warning");
+            return;
+          }
+          const text = `[Pinned from the current user message]:\n${msg.slice(0, MAX_ORIGIN_TURN_CHARS)}`;
+          setPinnedContext(text, "user");
+          saveState(ctx);
+          ctx.ui.notify(
+            `Pinned context set from the latest user message (${text.length} chars). Applies at the next compaction — /self-propagate compact to apply now.`,
+            "info"
+          );
+          return;
+        }
+
+        if (action === "draft") {
+          if (state.persisted.pendingCompaction || state.isCompacting) {
+            ctx.ui.notify(
+              "A compaction is already queued or running — pin_rewrite is blocked until it completes. Try again afterwards.",
+              "warning"
+            );
+            return;
+          }
+          pi.sendUserMessage(
+            `<pin_rewrite_request>The user asked you to draft a replacement for the pinned context (the mandate baked into every compaction). Review the current pinned context and the session's trajectory, then call pin_rewrite with the new text and a reason — the user will approve or reject it.</pin_rewrite_request>`,
+            { deliverAs: "steer" }
+          );
+          ctx.ui.notify(
+            "Asked the agent to draft a new pinned context (you will be asked to approve it).",
+            "info"
+          );
+          return;
+        }
+
+        ctx.ui.notify(
+          `Unknown pin action '${parts[1] ?? ""}'. Use: show | set <text> | clear | reset | here | draft`,
+          "warning"
+        );
+        return;
+      }
+
+      if (sub === "compact") {
+        if (!state.persisted.enabled) {
+          ctx.ui.notify("Self-propagation is disabled for this session.", "warning");
+          return;
+        }
+        if (state.persisted.pendingCompaction || state.isCompacting) {
+          ctx.ui.notify(
+            "A compaction is already queued — it will run at the end of the current turn.",
+            "info"
+          );
+          return;
+        }
+        pi.sendUserMessage(
+          `<force_compact reason="user">The user ran /self-propagate compact. Persist anything critical via memory_store, then call self_compact now (continueAfter: true unless you are meant to pause) so context is cleanly checkpointed — the current pinned context will be re-baked verbatim.</force_compact>`,
+          { deliverAs: "steer" }
+        );
+        ctx.ui.notify(
+          "Asked the agent to compact now. (Compaction replaces the whole prefix — full cache miss, unavoidable and deliberate.)",
+          "info"
+        );
+        return;
+      }
+
       if (sub === "status" || sub === "s") {
         ctx.ui.notify(propagateStatusDetail(ctx), "info");
         return;
       }
 
       ctx.ui.notify(
-        `Unknown subcommand '${parts[0]}'. Run /propagate help to see usage.`,
+        `Unknown subcommand '${parts[0]}'. Run /self-propagate help to see usage.`,
         "warning"
-      );
-    },
-  });
-
-  pi.registerCommand("keep-awake", {
-    description:
-      "Keep-awake cron loop for this session: /keep-awake <minutes|off>",
-    getArgumentCompletions: (prefix: string) => {
-      const lower = prefix.toLowerCase();
-      const values: Array<[string, string]> = [
-        ["off", "Disable the keep-awake timer"],
-        ["5", "Wake after 5m idle"],
-        ["10", "Wake after 10m idle"],
-        ["15", "Wake after 15m idle"],
-        ["30", "Wake after 30m idle"],
-      ];
-      const items = values
-        .filter(([v]) => v.startsWith(lower))
-        .map(([value, description]) => ({ value, label: value, description }));
-      return items.length > 0 ? items : null;
-    },
-    handler: async (args, ctx) => {
-      state.latestCtx = ctx;
-      const arg = (args || "").trim().toLowerCase();
-
-      if (!arg) {
-        ctx.ui.notify(
-          `Keep-awake is currently ${state.persisted.keepAwakeMinutes > 0 ? `ON (${state.persisted.keepAwakeMinutes}m)` : "OFF"}.`,
-          "info"
-        );
-        return;
-      }
-
-      if (arg === "off" || arg === "0") {
-        state.persisted.keepAwakeMinutes = 0;
-        saveState(ctx);
-        updateFooterStatus(ctx);
-        ctx.ui.notify("Keep-awake timer disabled.", "info");
-        return;
-      }
-
-      const mins = parseFloat(arg);
-      if (isNaN(mins) || mins <= 0) {
-        ctx.ui.notify("Usage: /keep-awake <minutes|off>", "warning");
-        return;
-      }
-
-      state.persisted.enabled = true; // Auto-enable propagation if keep-awake is turned on
-      state.persisted.keepAwakeMinutes = mins;
-      state.lastActiveAt = Date.now();
-      saveState(ctx);
-      syncToolVisibility();
-      updateFooterStatus(ctx);
-      ctx.ui.notify(
-        `Keep-awake enabled: session will wake after ${mins}m of inactivity (Self-propagation enabled).`,
-        "info"
       );
     },
   });
@@ -922,7 +1306,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
     const { tokens, budgetCeiling, budgetPercent } = getBudgetMetrics(ctx);
 
-    let budgetDirective = "";
+    let budgetAlert: string | null = null;
     if (budgetPercent >= 100) {
       state.persisted.overBudgetTurns += 1;
       const remainingGrace = Math.max(
@@ -930,38 +1314,42 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         GRACE_TURNS_AT_100 - state.persisted.overBudgetTurns + 1
       );
       if (state.persisted.overBudgetTurns <= GRACE_TURNS_AT_100) {
-        budgetDirective =
-          `\n\n[CRITICAL CONTEXT ALERT — 100% BUDGET REACHED (${tokens}/${budgetCeiling} tokens) — GRACE TURN ${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100}]\n` +
+        budgetAlert =
+          `[CRITICAL CONTEXT ALERT — 100% BUDGET REACHED (${tokens}/${budgetCeiling} tokens) — GRACE TURN ${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100}]\n` +
           `You MUST wrap up your current thought and call \`self_compact\` within ${remainingGrace} turn(s). ` +
           `After turn ${GRACE_TURNS_AT_100}, all tools except \`self_compact\` and \`memory_store\` will be HARD-LOCKED.`;
       } else {
-        budgetDirective =
-          `\n\n[HARD CONTEXT LOCK ENGAGED — GRACE PERIOD EXPIRED (${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100} turns over 100%)]\n` +
+        budgetAlert =
+          `[HARD CONTEXT LOCK ENGAGED — GRACE PERIOD EXPIRED (${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100} turns over 100%)]\n` +
           `All standard tools are now blocked. You MUST call \`self_compact\` immediately.`;
       }
     } else {
       state.persisted.overBudgetTurns = 0;
       if (budgetPercent >= 75) {
-        budgetDirective =
-          `\n\n[CONTEXT WARNING: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens). ` +
+        budgetAlert =
+          `[CONTEXT WARNING: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens). ` +
           `Reach a clean checkpoint soon and call \`self_compact\` to free context.]`;
       } else if (budgetPercent >= 50) {
-        budgetDirective =
-          `\n\n[CONTEXT NOTICE: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens) used.]`;
+        budgetAlert =
+          `[CONTEXT NOTICE: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens) used.]`;
       }
     }
 
     updateFooterStatus(ctx);
     saveState(ctx); // persist overBudgetTurns / idleCompactWarned changes
 
-    const protocolAppend =
-      `\n\n## Self-Propagation & Context Protocol\n` +
-      `- Persistent Working Memory (${Object.keys(state.persisted.kv).length}/${MAX_KV_ENTRIES} keys): Use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts.\n` +
-      `- When calling \`self_compact\`, all prior turns (except \`keepFirstTurns\`) are wiped. Your \`summary\` must contain all active state, modified files, and next steps.` +
-      budgetDirective;
-
     return {
-      systemPrompt: (event.systemPrompt || "") + protocolAppend,
+      systemPrompt: (event.systemPrompt || "") + PROTOCOL_STATIC,
+      ...(budgetAlert
+        ? {
+            message: {
+              customType: "self_propagate_budget",
+              content: `<self_propagate_budget level="${budgetPercent >= 100 ? "critical" : budgetPercent >= 75 ? "warning" : "notice"}">\n${budgetAlert}\n</self_propagate_budget>`,
+              display: false,
+              details: { tokens, budgetCeiling, budgetPercent },
+            },
+          }
+        : {}),
     };
   });
 
@@ -1023,14 +1411,49 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
     if (!state.persisted.pendingCompaction) return;
 
+    // Total handler: a failure here must never let pi fall back to its default
+    // compaction (which would silently drop the pinned context, the KV memory
+    // and the agent's checkpoint). Degrade per-block and tag the result instead.
     const job = state.persisted.pendingCompaction;
-    const originBlock = extractFirstTurnsBlock(ctx, job.keepFirstTurns);
-    const memoryBlock = renderWorkingMemoryBlock();
+    const problems: string[] = [];
+
+    let originBlock = "";
+    try {
+      originBlock = renderPinnedContextBlock(ctx, job.keepFirstTurns);
+    } catch (e) {
+      problems.push(`pinned context failed to render: ${errMsg(e)}`);
+    }
+
+    let memoryBlock = "";
+    try {
+      memoryBlock = renderWorkingMemoryBlock();
+    } catch (e) {
+      problems.push(`working memory failed to render: ${errMsg(e)}`);
+    }
+
+    let kvKeys: string[] = [];
+    try {
+      kvKeys = Object.keys(state.persisted.kv);
+    } catch {
+      kvKeys = [];
+    }
+
+    const problemNote = problems.length
+      ? `\n[self-propagate: checkpoint DEGRADED — ${problems.join("; ")}]\n`
+      : "";
+
+    if (problems.length > 0) {
+      ctx.ui?.notify?.(
+        `Self-propagate checkpoint rendered in degraded mode: ${problems.join("; ")}`,
+        "warning"
+      );
+    }
 
     const compositeSummary =
       `${originBlock}` +
       `${memoryBlock}\n\n` +
-      `<compaction_summary>\n${job.summary}\n</compaction_summary>`;
+      problemNote +
+      `<compaction_summary>\n${scrubContextTags(job.summary)}\n</compaction_summary>`;
 
     return {
       compaction: {
@@ -1041,7 +1464,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         details: {
           selfPropagated: true,
           keepFirstTurns: job.keepFirstTurns,
-          kvKeys: Object.keys(state.persisted.kv),
+          pinSource: state.persisted.pinnedContext?.source ?? null,
+          kvKeys,
+          degraded: problems.length > 0,
         },
       },
     };

@@ -1,7 +1,7 @@
 {
   "name": "@lambdasafe/pi-extensions",
   "version": "0.3.0",
-  "description": "Lambdasafe Pi extensions: workspace-swarm (HTTP group chat / agent bus per workspace), ringfence (default-deny guardrail around the workspace, with optional decision-model judging of shell commands), ask-jev (fast predicate/choice/score judgements from a local LM Studio decision model over many files) and self-propagate (agent-authored context self-compaction with persistent KV working memory, /propagate and /keep-awake).",
+  "description": "Lambdasafe Pi extensions: workspace-swarm (HTTP group chat / agent bus per workspace), ringfence (default-deny guardrail around the workspace, with optional decision-model judging of shell commands), ask-jev (fast predicate/choice/score judgements from a local LM Studio decision model over many files) and self-propagate (agent-authored context self-compaction with persistent KV working memory, /self-propagate).",
   "keywords": [
     "pi-package",
     "pi",
