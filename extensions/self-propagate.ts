@@ -23,6 +23,11 @@ const GRACE_TURNS_AT_100 = 5;
 // fire forever at the floor (a flat absolute threshold would).
 const FLOOR_BOOTSTRAP_TOKENS = 15_000;
 const RECLAIM_MARGIN_TOKENS = 10_000;
+// The absolute half of the gate: re-reading 25k+ on Apple Silicon is minutes of
+// compute regardless of the floor. The gate is the LARGER of the two — the
+// absolute keeps a 25k+ prefix shrinking (the user's number); the relative keeps
+// the gate from firing forever when the floor itself is 25k+ (a fat tool head).
+const PRESSURE_ABS_TOKENS = 25_000;
 const RETAIN_NONE_SENTINEL = "__self_propagate_retain_none__";
 
 // Static protocol text appended to every system prompt. MUST stay byte-identical
@@ -45,7 +50,7 @@ function renderProtocolBlock(ctx: ExtensionContext, persisted: PersistedSessionS
     `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
     `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
     `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps. If pi refuses the compaction (its error is reported to you), your history is retained — do not believe a checkpoint happened, and retry self_compact later if you still need it.\n` +
-    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is ${RECLAIM_MARGIN_TOKENS / 1000}k+ above the post-compact floor, then holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
+    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 10k+ above the post-compact floor, if larger) — one planned bust, then it holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
   );
 }
 
@@ -303,10 +308,11 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   // Pressure gate: is the current prefix meaningfully larger than the smallest
   // prefix this session can have (post-compact floor + margin)?
   function overReclaimGate(ctx: ExtensionContext): boolean {
-    return (
-      getBudgetMetrics(ctx).tokens >=
+    const gate = Math.max(
+      PRESSURE_ABS_TOKENS,
       state.persisted.cacheFloorTokens + RECLAIM_MARGIN_TOKENS
     );
+    return getBudgetMetrics(ctx).tokens >= gate;
   }
 
   function updateFooterStatus(ctx: ExtensionContext): void {
@@ -965,7 +971,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "wake_defer",
     label: "Defer Wake Ticks",
     description:
-      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: if the prefix is ${RECLAIM_MARGIN_TOKENS / 1000}k+ tokens above the post-compact floor, a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
+      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: if the prefix is 25k+ tokens (or 10k+ above the post-compact floor, if larger), a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
     parameters: {
       type: "object",
       properties: {
