@@ -18,7 +18,7 @@ const BRANCH = [
 	{ id: "e3", type: "message", message: { role: "user", content: "also add a watchdog" } },
 ];
 
-function boot(sessionId, { tokens = 1000, branch = BRANCH } = {}) {
+function boot(sessionId, { tokens = 1000, branch = BRANCH, model, compactOk = true } = {}) {
 	const tools = {};
 	const commands = {};
 	const events = {};
@@ -40,13 +40,17 @@ function boot(sessionId, { tokens = 1000, branch = BRANCH } = {}) {
 	};
 	const ctx = {
 		cwd: dir,
+		model,
 		sessionManager: {
 			getSessionId: () => sessionId,
 			getSessionFile: () => path.join(dir, `${sessionId}.jsonl`),
 			getBranch: () => branch,
 		},
 		getContextUsage: () => ({ contextWindow: 100000, tokens }),
-		compact: (opts) => { compactCalls.push(opts); opts.onComplete?.(); },
+		compact: (opts) => {
+			compactCalls.push(opts);
+			compactOk ? opts.onComplete?.() : opts.onError?.(new Error("Nothing to compact (session too small)"));
+		},
 		ui: {
 			notify: (m) => notifyLog.push(String(m)),
 			setStatus: () => {},
@@ -284,6 +288,51 @@ assert.equal(s9.readMemory().pinnedContext?.text, "", "skip stores a deliberate 
 assert.equal(s9.readMemory().pinnedContext?.source, "user", "skip is a user decision, not a seed");
 const skipOut = await s9.events.before_agent_start({ systemPrompt: "base" }, s9.ctx);
 assert.doesNotMatch(skipOut.systemPrompt, /No session goal set/, "skip disables the no-goal nudge");
+
+// ---- Phase 9: a refused compaction corrects the agent's record ----------------
+fs.writeFileSync(path.join(dir, ".pi", "memory", "sess-fail.json"), JSON.stringify({ enabled: true }));
+const s10 = boot("sess-fail", { compactOk: false });
+await s10.events.session_start({}, s10.ctx);
+assert.equal(s10.activeTools.includes("wake_defer"), true, "wake_defer declared after opt-in");
+await s10.tools.self_compact.execute("f1", { summary: "mid-flight checkpoint", continueAfter: false }, undefined, undefined, s10.ctx);
+await s10.events.agent_end({}, s10.ctx);
+assert.equal(s10.compactCalls.length, 1, "compaction attempted at turn end");
+assert.equal(s10.readMemory().pendingCompaction, null, "failed checkpoint is not re-queued");
+const failSteer = s10.sent.map((s) => s.msg).find((m) => /self_propagation_compaction_failed/.test(m)) ?? "";
+assert.match(failSteer, /NOT applied/i, "agent is told the checkpoint did not happen");
+assert.match(failSteer, /retained/i, "agent is told the history was retained");
+assert.match(failSteer, /Nothing to compact/, "pi's refusal reason is surfaced to the agent");
+assert.match(failSteer, /do NOT retry immediately/i, "agent is told not to retry while too small");
+assert.equal(s10.sent.at(-1).opts.deliverAs, "steer", "the correction rides a steer so it starts a turn");
+assert.match(notified(s10), /Self-compaction failed/, "user is notified of the failure");
+
+// ---- Phase 10: wake deferral ---------------------------------------------------
+const s11 = boot("sess-defer");
+await s11.events.session_start({}, s11.ctx);
+await s11.commands["self-propagate"].handler("on", s11.ctx);
+await s11.commands["self-propagate"].handler("wake every 5", s11.ctx);
+await s11.tools.wake_defer.execute("d1", { minutes: 30 }, undefined, undefined, s11.ctx);
+assert.ok(s11.readMemory().wakeDeferredUntil > Date.now() + 29 * 60_000, "deferral persisted");
+await s11.commands["self-propagate"].handler("status", s11.ctx);
+assert.match(notified(s11), /deferred 30m/, "status reports the deferral");
+await s11.tools.wake_defer.execute("d2", { minutes: 0 }, undefined, undefined, s11.ctx);
+assert.equal(s11.readMemory().wakeDeferredUntil, 0, "minutes 0 clears the deferral");
+await s11.tools.wake_defer.execute("d3", { minutes: 20 }, undefined, undefined, s11.ctx);
+assert.ok(s11.readMemory().wakeDeferredUntil > Date.now(), "deferral re-set for the config test");
+await s11.commands["self-propagate"].handler("wake every 15", s11.ctx);
+assert.equal(s11.readMemory().wakeDeferredUntil, 0, "explicit user wake config clears the deferral");
+
+// ---- Phase 11: the protocol head states the numeric ceiling, byte-stably --------
+const s12 = boot("sess-ceiling", { model: { contextWindow: 200000 } });
+await s12.events.session_start({}, s12.ctx);
+await s12.commands["self-propagate"].handler("on", s12.ctx);
+await s12.commands["self-propagate"].handler("budget 0.5", s12.ctx);
+const p1 = await s12.events.before_agent_start({ systemPrompt: "base" }, s12.ctx);
+const p2 = await s12.events.before_agent_start({ systemPrompt: "base" }, s12.ctx);
+assert.equal(p1.systemPrompt, p2.systemPrompt, "protocol head is byte-stable turn to turn");
+assert.match(p1.systemPrompt, /100k tokens/, "ceiling = 50% of the 200k window");
+assert.match(p1.systemPrompt, /pi's own context bar/i, "the two percentage bases are distinguished");
+assert.match(p1.systemPrompt, /wake_defer/, "deferral tool is documented in the protocol");
 
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
 const leftovers = fs.readdirSync(path.join(dir, ".pi", "memory")).filter((f) => f.includes(".tmp."));

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 
 // --- Constants & Guardrails ---
-const EXTENSION_TOOLS = ["self_compact", "memory_store", "goal_set"] as const;
+const EXTENSION_TOOLS = ["self_compact", "memory_store", "goal_set", "wake_defer"] as const;
 const MAX_KV_ENTRIES = 25;
 const MAX_KEY_LEN = 48;
 const MAX_TITLE_LEN = 100;
@@ -19,12 +19,25 @@ const RETAIN_NONE_SENTINEL = "__self_propagate_retain_none__";
 // across turns and compactions: pi sends a forced prompt as the leading system
 // message on every request (a cache miss whenever it changes), so anything
 // volatile here re-reads the whole prompt every turn. Volatile budget alerts
-// are delivered as a `<self_propagate_budget>` custom message instead.
-const PROTOCOL_STATIC =
-  `\n\n## Self-Propagation & Context Protocol\n` +
-  `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
-  `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
-  `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps.`;
+// are delivered as a `<self_propagate_budget>` custom message instead. The one
+// model-dependent byte is the numeric ceiling line, which changes solely on a
+// model switch or `/self-propagate budget` — both already cost a full prompt
+// rebuild, so the head stays cache-stable.
+function renderProtocolBlock(ctx: ExtensionContext, persisted: PersistedSessionState): string {
+  const window =
+    (ctx as any).model?.contextWindow ||
+    ctx.getContextUsage?.()?.contextWindow ||
+    128000;
+  const ceiling = Math.floor(window * persisted.budgetRatio);
+  return (
+    `\n\n## Self-Propagation & Context Protocol\n` +
+    `- Effective context budget: ${Math.round(ceiling / 1000)}k tokens (${Math.round(persisted.budgetRatio * 100)}% of the ${Math.round(window / 1000)}k-token model window). [Context: ...] tool tags, the footer and <self_propagate_budget> alerts are percentages of THIS ceiling; pi's own context bar is a percentage of the full window — never mix the two.\n` +
+    `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
+    `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
+    `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps. If pi refuses the compaction (its error is reported to you), your history is retained — do not believe a checkpoint happened, and retry self_compact later if you still need it.\n` +
+    `- If you expect no substantive events for a while, call \`wake_defer\` with the minutes to silence keep-awake ticks until then (0 clears the deferral).`
+  );
+}
 
 interface MemoryEntry {
   key: string;
@@ -53,6 +66,7 @@ interface PersistedSessionState {
   pendingCompaction: PendingCompaction | null;
   overBudgetTurns: number;
   idleCompactWarned: boolean;
+  wakeDeferredUntil: number; // epoch ms; 0 = not deferred
 }
 
 interface PendingCompaction {
@@ -88,6 +102,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       pendingCompaction: null,
       overBudgetTurns: 0,
       idleCompactWarned: false,
+      wakeDeferredUntil: 0,
     },
     isBusy: false,
     isCompacting: false,
@@ -157,6 +172,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           pendingCompaction,
           overBudgetTurns: Math.max(0, Math.floor(Number(raw.overBudgetTurns) || 0)),
           idleCompactWarned: Boolean(raw.idleCompactWarned ?? false),
+          wakeDeferredUntil: Math.max(0, Math.floor(Number(raw.wakeDeferredUntil) || 0)),
         };
         return;
       } catch {
@@ -175,6 +191,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       pendingCompaction: null,
       overBudgetTurns: 0,
       idleCompactWarned: false,
+      wakeDeferredUntil: 0,
     };
   }
 
@@ -275,10 +292,13 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       return;
     }
     const { tokens, budgetCeiling, budgetPercent } = getBudgetMetrics(ctx);
+    const deferredMs = state.persisted.wakeDeferredUntil - Date.now();
     const wakeTag =
-      state.persisted.keepAwakeMinutes > 0
-        ? ` ⏰${state.persisted.keepAwakeMinutes}m`
-        : "";
+      deferredMs > 0
+        ? ` ⏸${Math.ceil(deferredMs / 60_000)}m`
+        : state.persisted.keepAwakeMinutes > 0
+          ? ` ⏰${state.persisted.keepAwakeMinutes}m`
+          : "";
     const kvCount = Object.keys(state.persisted.kv).length;
     const graceTag =
       state.persisted.overBudgetTurns > 0
@@ -368,7 +388,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   // leading angle bracket from any closing/opening tag the checkpoint uses.
   function scrubContextTags(text: string): string {
     return text.replace(
-      /<(\/?)(pinned_context|working_memory|compaction_summary|note|idle_compaction_notice|keep_awake_tick|force_compact|goal_set_request|self_propagation_resume)\b/gi,
+      /<(\/?)(pinned_context|working_memory|compaction_summary|note|idle_compaction_notice|keep_awake_tick|force_compact|goal_set_request|self_propagation_resume|self_propagation_compaction_failed)\b/gi,
       "[$1$2"
     );
   }
@@ -531,9 +551,23 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         state.isCompacting = false;
         state.persisted.pendingCompaction = null;
         saveState(ctx);
+        const reason = err instanceof Error ? err.message : String(err);
         ctx.ui?.notify?.(
-          `Self-compaction failed: ${err instanceof Error ? err.message : String(err)}`,
+          `Self-compaction failed: ${reason}`,
           "error"
+        );
+        // The agent was told "queued, conclude your turn" and may believe a
+        // checkpoint happened. Correct the record: nothing was wiped, the summary
+        // was not applied, and (for pi's "too small" refusal) an immediate retry
+        // would fail the same way.
+        pi.sendUserMessage(
+          `<self_propagation_compaction_failed reason="${reason}">\n` +
+          `Your self_compact checkpoint was NOT applied — pi's compaction refused it: ${reason}.\n` +
+          `Your full conversation history is retained and your written summary was not baked in. ` +
+          `If the reason is "Nothing to compact (session too small)", the session is below pi's minimum compactable size: do NOT retry immediately; retry self_compact after context has grown. ` +
+          `Otherwise continue working — the checkpoint will be re-queued if you call self_compact again.\n` +
+          `</self_propagation_compaction_failed>`,
+          { deliverAs: "steer" }
         );
       },
     });
@@ -557,6 +591,11 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           return;
         }
 
+        // A deferral (agent or user) suppresses every wake mode until it expires.
+        if (Date.now() < state.persisted.wakeDeferredUntil) {
+          return;
+        }
+
         const idleMs = Date.now() - state.lastActiveAt;
 
         // Mode 1: Keep-Awake Cron
@@ -569,6 +608,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
               `<keep_awake_tick idle_minutes="${state.persisted.keepAwakeMinutes}" context_budget="${budgetPercent}%">\n` +
                 `Session wake tick triggered because no activity occurred for ${state.persisted.keepAwakeMinutes}m.\n` +
                 `Review your <working_memory> and current objectives. If context budget (${budgetPercent}%) is high, call self_compact.\n` +
+                `If you expect no substantive events for a while, call wake_defer with the minutes to silence ticks until then.\n` +
                 `</keep_awake_tick>`,
               { deliverAs: "steer" }
             );
@@ -591,6 +631,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
               `<idle_compaction_notice idle_minutes="${state.persisted.idleCompactMinutes}" context_budget="${budgetPercent}%">\n` +
                 `The session has been inactive for ${state.persisted.idleCompactMinutes} minutes at ${budgetPercent}% context budget.\n` +
                 `Persist any important notes via memoryUpserts and call self_compact({ continueAfter: false, ... }) now so the session is cleanly compacted while idle.\n` +
+                `If you expect no substantive events for a while, call wake_defer with the minutes to silence further notices.\n` +
                 `</idle_compaction_notice>`,
               { deliverAs: "steer" }
             );
@@ -897,6 +938,55 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerTool({
+    name: "wake_defer",
+    label: "Defer Wake Ticks",
+    description:
+      "Silence self-propagate wake ticks (keep-awake and idle-compact) for N minutes; pass 0 to clear an active deferral. Use it when you expect no substantive events for a while so ticks do not burn context. The deferral persists across restarts and is shown in the footer/status.",
+    parameters: {
+      type: "object",
+      properties: {
+        minutes: {
+          type: "number",
+          description: "Minutes of silence to defer (>= 0). 0 clears the deferral immediately.",
+        },
+      },
+      required: ["minutes"],
+    },
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      if (!state.persisted.enabled) {
+        return {
+          content: [{ type: "text", text: "Self-propagation is disabled for this session." }],
+          details: {},
+        };
+      }
+      const mins = Number(params.minutes);
+      if (!Number.isFinite(mins) || mins < 0) {
+        return {
+          content: [
+            { type: "text", text: `Error: minutes must be a number >= 0 (got ${params.minutes}).` },
+          ],
+          details: {},
+        };
+      }
+      state.persisted.wakeDeferredUntil = mins > 0 ? Date.now() + mins * 60_000 : 0;
+      saveState(ctx);
+      updateFooterStatus(ctx);
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              mins > 0
+                ? `Wake ticks deferred for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.`
+                : "Wake deferral cleared — ticks resume on the next idle interval.",
+          },
+        ],
+        details: { deferredUntil: state.persisted.wakeDeferredUntil },
+      };
+    },
+  });
+
   // --- Commands: /self-propagate ---
   const PROPAGATE_SUBS = [
     { value: "on", description: "Enable self-propagation for this session" },
@@ -904,7 +994,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     { value: "off", description: "Disable; clears both wake timers and any queued compaction" },
     { value: "status", description: "Full state: budget bar, goal, anchor, KV store, timers" },
     { value: "budget", description: "Set/show budget ceiling as fraction of model window (0.3–0.95, default 0.85)" },
-    { value: "wake", description: "Wake the idle agent: `once <minutes>` (compact & pause when idle ≥25% budget) or `every <minutes>` (keep working; auto-enables) | `off`" },
+    { value: "wake", description: "Wake the idle agent: `once <minutes>` (compact & pause when idle ≥25% budget) or `every <minutes>` (keep working; auto-enables) | `off` (also clears any wake_defer)" },
     { value: "goal", description: "Manage the session goal: show | set <text> | clear | reset | here | draft" },
     { value: "compact", description: "Ask the agent to compact right now" },
     { value: "help", description: "Show this help" },
@@ -944,6 +1034,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     const anchor = state.persisted.anchorEntryId
       ? `${state.persisted.anchorEntryId.slice(0, 12)}… (set via /self-propagate on here)`
       : "session start (default)";
+    const deferredMs = state.persisted.wakeDeferredUntil - Date.now();
+    const deferDesc = deferredMs > 0 ? ` | deferred ${Math.ceil(deferredMs / 60_000)}m` : "";
     const tier =
       budgetPercent >= 100
         ? "OVER BUDGET — grace turns running"
@@ -958,7 +1050,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       `  Budget   ${renderBudgetBar(budgetPercent)} ${budgetPercent}%  (${tokens}/${Math.round(budgetCeiling)} tokens; window ${physicalWindow}, ceiling ${Math.round(state.persisted.budgetRatio * 100)}%) — ${tier}`,
       `  Goal     ${pinDesc} | anchor: ${anchor}`,
       `  KV       ${kv}/${MAX_KV_ENTRIES} notes | file: .pi/memory/${currentSessionId(ctx).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`,
-      `  Timers   wake every ${state.persisted.keepAwakeMinutes > 0 ? `${state.persisted.keepAwakeMinutes}m` : "off"} | wake once ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"}`,
+      `  Timers   wake every ${state.persisted.keepAwakeMinutes > 0 ? `${state.persisted.keepAwakeMinutes}m` : "off"} | wake once ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"}${deferDesc}`,
     ].join("\n");
   }
 
@@ -987,7 +1079,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       "                     Wake tick: every N minutes idle, the agent reviews objectives",
       "                     and keeps working (or compacts if budget is high).",
       "                     Auto-enables self-propagation. 0 disables.",
-      "  wake off           Disable both wake modes. No argument shows both values.",
+      "  wake off           Disable both wake modes and any active deferral. No argument shows both values.",
       "  goal [show]        Show the session goal (the mandate re-baked into every",
       "                     checkpoint). You can keep/edit/skip it when enabling.",
       "  goal set <text>    Replace the goal with <text>.",
@@ -1005,7 +1097,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       "  apply only with your approval.",
       "",
       "Related tooling",
-      "  self_compact, memory_store, goal_set      Tools, only declared while enabled.",
+      "  self_compact, memory_store, goal_set, wake_defer   Tools, only declared while enabled.",
       "  .pi/memory/<session>.json                 KV notes + goal + flags; survives /reload and resume.",
     ].join("\n");
   }
@@ -1137,6 +1229,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         state.persisted.idleCompactWarned = false;
         state.persisted.overBudgetTurns = 0;
         state.persisted.pendingCompaction = null;
+        state.persisted.wakeDeferredUntil = 0;
         saveState(ctx);
         syncToolVisibility();
         updateFooterStatus(ctx);
@@ -1168,9 +1261,11 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         const mode = (parts[1] || "").trim().toLowerCase();
         const everyDesc = state.persisted.keepAwakeMinutes > 0 ? `every ${state.persisted.keepAwakeMinutes}m` : "every off";
         const onceDesc = state.persisted.idleCompactMinutes > 0 ? `once ${state.persisted.idleCompactMinutes}m` : "once off";
+        const deferredMs = state.persisted.wakeDeferredUntil - Date.now();
+        const deferDesc = deferredMs > 0 ? ` | deferred ${Math.ceil(deferredMs / 60_000)}m` : "";
         if (!mode) {
           ctx.ui.notify(
-            `Wake timers: ${everyDesc} | ${onceDesc} (every takes precedence). Set with /self-propagate wake <once|every> <minutes> | off.`,
+            `Wake timers: ${everyDesc} | ${onceDesc}${deferDesc} (every takes precedence). Set with /self-propagate wake <once|every> <minutes> | off.`,
             "info"
           );
           return;
@@ -1179,6 +1274,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           state.persisted.keepAwakeMinutes = 0;
           state.persisted.idleCompactMinutes = 0;
           state.persisted.idleCompactWarned = false;
+          state.persisted.wakeDeferredUntil = 0;
           saveState(ctx);
           updateFooterStatus(ctx);
           ctx.ui.notify("Wake timers disabled.", "info");
@@ -1193,6 +1289,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           if (mode === "once") {
             state.persisted.idleCompactMinutes = mins;
             state.persisted.keepAwakeMinutes = 0; // once-mode only fires when the every-timer is off
+            state.persisted.wakeDeferredUntil = 0;
             saveState(ctx);
             updateFooterStatus(ctx);
             ctx.ui.notify(
@@ -1212,6 +1309,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
             state.persisted.enabled = true; // Auto-enable propagation if wake-every is turned on
             state.persisted.keepAwakeMinutes = mins;
             state.lastActiveAt = Date.now();
+            state.persisted.wakeDeferredUntil = 0;
             saveState(ctx);
             syncToolVisibility();
             updateFooterStatus(ctx);
@@ -1448,8 +1546,10 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       ? ""
       : `\n- No session goal set. Propose one via \`goal_set\` (the user must approve) — it re-injects at the next compaction and keeps long-horizon work anchored.`;
 
+    // The volatile budget state never enters the head — only the stable protocol
+    // block (with its model-relative ceiling line) is appended to the system prompt.
     return {
-      systemPrompt: (event.systemPrompt || "") + PROTOCOL_STATIC + goalNudge,
+      systemPrompt: (event.systemPrompt || "") + renderProtocolBlock(ctx, state.persisted) + goalNudge,
       ...(budgetAlert
         ? {
             message: {
