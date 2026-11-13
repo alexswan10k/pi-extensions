@@ -17,21 +17,13 @@ const BRANCH = [
 	{ id: "e2", type: "message", message: { role: "assistant", content: "on it" } },
 	{ id: "e3", type: "message", message: { role: "user", content: "also add a watchdog" } },
 ];
-// A raw tail pi would accept cutting: ~30k estimated tokens (chars/4) since
-// the last compaction — above pi's ~20k compaction floor.
-const BRANCH_BIG = Array.from({ length: 30 }, (_, i) =>
-	i % 2 === 0
-		? { id: `b${i}`, type: "message", message: { role: "user", content: "u".repeat(4000) } }
-		: { id: `b${i}`, type: "message", message: { role: "assistant", content: [{ type: "text", text: "a".repeat(4000) }] } }
-);
 
-function boot(sessionId, { tokens = 1000, branch = BRANCH, model, compactOk = true } = {}) {
+function boot(sessionId, { tokens = 1000, branch = BRANCH, model } = {}) {
 	const tools = {};
 	const commands = {};
 	const events = {};
 	const notifyLog = [];
 	const sent = [];
-	const compactCalls = [];
 	const activeTools = ["bash", "read"];
 	const confirmQueue = [];
 	const confirmCalls = [];
@@ -54,10 +46,6 @@ function boot(sessionId, { tokens = 1000, branch = BRANCH, model, compactOk = tr
 			getBranch: () => branch,
 		},
 		getContextUsage: () => ({ contextWindow: 100000, tokens }),
-		compact: (opts) => {
-			compactCalls.push(opts);
-			compactOk ? opts.onComplete?.() : opts.onError?.(new Error("Nothing to compact (session too small)"));
-		},
 		ui: {
 			notify: (m) => notifyLog.push(String(m)),
 			setStatus: () => {},
@@ -72,7 +60,7 @@ function boot(sessionId, { tokens = 1000, branch = BRANCH, model, compactOk = tr
 	mod.default(pi);
 	const memoryFile = path.join(dir, ".pi", "memory", `${sessionId}.json`);
 	const readMemory = () => JSON.parse(fs.readFileSync(memoryFile, "utf8"));
-	return { ctx, tools, commands, events, notifyLog, sent, compactCalls, activeTools, memoryFile, readMemory, confirmQueue, confirmCalls, selectQueue, inputQueue };
+	return { ctx, tools, commands, events, notifyLog, sent, activeTools, memoryFile, readMemory, confirmQueue, confirmCalls, selectQueue, inputQueue };
 }
 const toolCall = (s, name) => s.events.tool_call({ toolName: name }, s.ctx);
 const notified = (s) => s.notifyLog.join("\n---\n");
@@ -153,32 +141,62 @@ assert.equal((await toolCall(s2, "goal_set"))?.block, true, "goal_set also block
 await s2.commands["self-propagate"].handler("compact", s2.ctx);
 assert.match(notified(s2), /already queued/i, "compact reports the queued checkpoint instead of steering");
 
-// Pi fires session_before_compact during ctx.compact; check the checkpoint that gets composed
-const sc = await s2.events.session_before_compact({ reason: "manual", preparation: { tokensBefore: 90000 } }, s2.ctx);
-assert.match(sc.compaction.summary, /<pinned_context source="seed"/, "floor clamps keepFirstTurns=0 to a seed pinned from turn 1/anchor");
-assert.match(sc.compaction.summary, /also add a watchdog/, "anchor start: goal seed begins at latest user message");
-assert.doesNotMatch(sc.compaction.summary.split("</pinned_context>")[0], /build the daemon/, "pre-anchor turn not in the seed");
-assert.match(sc.compaction.summary, /<working_memory/, "working memory baked into checkpoint");
-assert.match(sc.compaction.summary, /<compaction_summary>\ndaemon scaffold done/, "agent summary baked in");
-assert.equal(sc.compaction.firstKeptEntryId, "__self_propagate_retain_none__", "zero tail entries retained");
-assert.equal(sc.compaction.details.selfPropagated, true);
-assert.equal(s2.readMemory().pinnedContext?.source, "seed", "seeded goal persisted at enable time (restored)");
-assert.match(s2.readMemory().pinnedContext?.text ?? "", /also add a watchdog/, "seeded goal holds the anchored turn");
+// Checkpoint composition is verified through the elision itself: agent_end
+// applies the queued checkpoint as a cut, persisted in memory state, exactly
+// what the `context` hook elides from provider requests.
+const fullMsgs = BRANCH.map((e) => e.message);
+const applyCut = async (s) => {
+	await s.events.agent_end({}, s.ctx);
+	return s.readMemory().cut;
+};
 
-// ---- Goal lifecycle: user override → agent rewrite (reject/approve) → clear → reset ----
-// NB: this whole block relies on pendingCompaction still being queued — session_before_compact
-// returns undefined (and the sc2-sc4 asserts blow up with a TypeError) only after agent_end.
-// Keep it above the "Agent ends" section below.
+// ---- Episode A: the pre-existing queued checkpoint (goal override first) ---
 await s2.commands["self-propagate"].handler("goal set ALWAYS RUN THE FOO TESTS BEFORE DONE", s2.ctx);
 await s2.commands["self-propagate"].handler("goal show", s2.ctx);
 assert.match(notified(s2), /ALWAYS RUN THE FOO TESTS/, "goal show reflects the user override");
 await s2.commands["self-propagate"].handler("status", s2.ctx);
 assert.match(notified(s2), /custom \(user/, "status reports a custom user pin");
-const sc2 = await s2.events.session_before_compact({ reason: "manual", preparation: { tokensBefore: 90000 } }, s2.ctx);
-assert.match(sc2.compaction.summary, /ALWAYS RUN THE FOO TESTS/, "user goal replaces the seed verbatim");
-assert.doesNotMatch(sc2.compaction.summary, /also add a watchdog/, "seed discarded after user override");
-assert.equal(sc2.compaction.details.pinSource, "user", "checkpoint records which goal was baked in");
 
+// agent_end applies the restored checkpoint as a cut
+const cutA = await applyCut(s2);
+assert.ok(cutA, "queued checkpoint applied at turn end");
+assert.match(cutA.checkpoint, /<pinned_context source="user"/, "user goal wins at checkpoint time");
+assert.match(cutA.checkpoint, /ALWAYS RUN THE FOO TESTS/, "user goal baked verbatim into the checkpoint");
+assert.doesNotMatch(cutA.checkpoint.split("</pinned_context>")[0], /also add a watchdog/, "seed discarded after user override");
+assert.match(cutA.checkpoint, /<working_memory/, "working memory baked into the checkpoint");
+assert.match(cutA.checkpoint, /<compaction_summary>\ndaemon scaffold done/, "agent summary baked into the checkpoint");
+assert.equal(s2.readMemory().pendingCompaction, null, "checkpoint cleared after application");
+assert.equal(s2.readMemory().overBudgetTurns, 0, "grace counter reset after checkpoint");
+assert.equal(s2.readMemory().cut.prefixCount, 3, "cut covers the three visible pre-cut messages");
+
+// The context hook elides the pre-cut history: checkpoint rides the head,
+// the raw tail after the anchor is kept.
+const elidedA = await s2.events.context({ messages: fullMsgs }, s2.ctx);
+assert.equal(elidedA.messages.length, 1, "pre-cut history fully elided at the boundary");
+assert.equal(elidedA.messages[0].role, "compactionSummary", "checkpoint rides the head of the request");
+assert.match(elidedA.messages[0].summary, /daemon scaffold done/, "checkpoint content shipped as the compactionSummary");
+const grown = [...fullMsgs, { role: "assistant", content: [{ type: "text", text: "working on it" }] }];
+const elidedB = await s2.events.context({ messages: grown }, s2.ctx);
+assert.equal(elidedB.messages.length, 2, "post-cut messages are kept after the checkpoint");
+assert.equal(elidedB.messages[1].content[0].text, "working on it", "the live tail survives elision");
+// Boundary mismatch (e.g. fork/navigation): nothing is dropped; the checkpoint
+// is prepended and history passes through, with a one-time warning.
+const mismatch = await s2.events.context({ messages: fullMsgs.slice(0, 2) }, s2.ctx);
+assert.equal(mismatch.messages.length, 3, "mismatch: checkpoint + full history, nothing dropped");
+assert.equal(mismatch.messages[0].role, "compactionSummary", "mismatch: checkpoint still injected");
+assert.match(notified(s2), /history is not elided/, "mismatch warns the user");
+assert.equal(s2.readMemory().cut, null, "mismatch drops the unreliable cut boundary");
+
+const unblocked = await toolCall(s2, "bash");
+assert.equal(unblocked?.block, undefined, "tools unblocked after checkpoint executed");
+
+// Compact-command: user forces a checkpoint request (steer); not blocked by empty queue
+await s2.commands["self-propagate"].handler("compact", s2.ctx);
+assert.match(s2.sent.at(-1).msg, /force_compact/, "compact sends a force_compact steer");
+// clear the queue bookkeeping — no checkpoint is pending right now
+assert.equal(s2.readMemory().pendingCompaction, null);
+
+// ---- Episode B: approve an agent goal rewrite -----------------------------
 s2.confirmQueue.push(false); // user rejects the agent's proposal
 const rejected = await s2.tools.goal_set.execute("t8", { text: "AGENT MANDATE V2", reason: "goal changed" }, undefined, undefined, s2.ctx);
 assert.match(rejected.content[0].text, /rejected/i, "rejected rewrite is not applied");
@@ -190,34 +208,29 @@ assert.equal(approved.details?.applied, true, "approved rewrite reports applied"
 assert.equal(s2.readMemory().pinnedContext?.source, "agent", "agent rewrite persisted with source=agent");
 assert.equal(s2.readMemory().pinnedContext?.text, "AGENT MANDATE V2");
 
-await s2.commands["self-propagate"].handler("goal clear", s2.ctx);
-const sc3 = await s2.events.session_before_compact({ reason: "manual", preparation: { tokensBefore: 90000 } }, s2.ctx);
-assert.match(sc3.compaction.summary, /<pinned_context status="empty"/, "cleared goal renders the empty marker");
+await s2.tools.self_compact.execute("t10", { summary: "checkpoint after agent rewrite", continueAfter: false }, undefined, undefined, s2.ctx);
+const cutB = await applyCut(s2);
+assert.match(cutB.checkpoint, /AGENT MANDATE V2/, "agent goal baked into the checkpoint");
+assert.doesNotMatch(cutB.checkpoint.split("</pinned_context>")[0], /ALWAYS RUN THE FOO TESTS/, "user override replaced by the approved agent goal");
 
+// ---- Episode C: goal clear renders the empty marker ------------------------
+await s2.commands["self-propagate"].handler("goal clear", s2.ctx);
+await s2.tools.self_compact.execute("t11", { summary: "checkpoint after clear", continueAfter: false }, undefined, undefined, s2.ctx);
+const cutC = await applyCut(s2);
+assert.match(cutC.checkpoint, /<pinned_context status="empty"/, "cleared goal renders the empty marker");
+
+// ---- Episode D: goal reset re-seeds from the branch -------------------------
 await s2.commands["self-propagate"].handler("goal reset", s2.ctx);
 assert.equal(s2.readMemory().pinnedContext, null, "goal reset returns to unseeded state");
-const sc4 = await s2.events.session_before_compact({ reason: "manual", preparation: { tokensBefore: 90000 } }, s2.ctx);
-assert.match(sc4.compaction.summary, /also add a watchdog/, "reset re-seeds from the branch");
+await s2.tools.self_compact.execute("t12", { summary: "checkpoint after reset", continueAfter: false }, undefined, undefined, s2.ctx);
+const cutD = await applyCut(s2);
+assert.match(cutD.checkpoint, /also add a watchdog/, "reset re-seeds from the branch");
 
-// pin here pins the latest user message verbatim
+// ---- Episode E: pin here pins the latest user message verbatim --------------
 await s2.commands["self-propagate"].handler("goal here", s2.ctx);
 assert.equal(s2.readMemory().pinnedContext?.source, "user", "goal here stores a user goal");
 assert.match(s2.readMemory().pinnedContext?.text ?? "", /watchdog/, "goal here captured the latest user message");
 assert.match(s2.readMemory().pinnedContext?.text ?? "", /\[Goal pinned from the current user message\]/, "goal here tags its provenance");
-
-// Agent ends: the restored checkpoint actually executes
-await s2.events.agent_end({}, s2.ctx);
-assert.equal(s2.compactCalls.length, 1, "restored checkpoint executed at next turn end");
-
-// onComplete cleared the pending checkpoint
-assert.equal(s2.readMemory().pendingCompaction, null, "checkpoint cleared after execution");
-assert.equal(s2.readMemory().overBudgetTurns, 0, "grace counter reset after checkpoint");
-const unblocked = await toolCall(s2, "bash");
-assert.equal(unblocked?.block, undefined, "tools unblocked after checkpoint executed");
-
-// Compact-command: user forces a checkpoint request (steer); not blocked by empty queue
-await s2.commands["self-propagate"].handler("compact", s2.ctx);
-assert.match(s2.sent.at(-1).msg, /force_compact/, "compact sends a force_compact steer");
 
 // ---- Phase 3: corrupt memory file degrades to safe defaults --------------------
 fs.writeFileSync(s2.memoryFile, "{ not json");
@@ -257,11 +270,9 @@ fs.writeFileSync(
 );
 const s6 = boot("sess-dead");
 await s6.events.session_start({}, s6.ctx);
-const deadSc = await s6.events.session_before_compact(
-	{ reason: "manual", preparation: { tokensBefore: 1000 } },
-	s6.ctx
-);
-assert.match(deadSc.compaction.summary, /build the daemon/, "dead anchor falls back to session-root seed");
+await s6.events.agent_end({}, s6.ctx);
+const deadCut = s6.readMemory().cut;
+assert.match(deadCut.checkpoint, /build the daemon/, "dead anchor falls back to session-root seed");
 assert.match(notified(s6), /anchor no longer resolves/i, "dead anchor fallback notifies the user");
 assert.equal(s6.readMemory().pinnedContext?.source, "seed", "root fallback persists a real seed, not an empty pin");
 
@@ -296,22 +307,22 @@ assert.equal(s9.readMemory().pinnedContext?.source, "user", "skip is a user deci
 const skipOut = await s9.events.before_agent_start({ systemPrompt: "base" }, s9.ctx);
 assert.doesNotMatch(skipOut.systemPrompt, /No session goal set/, "skip disables the no-goal nudge");
 
-// ---- Phase 9: a refused compaction corrects the agent's record ----------------
+// ---- Phase 9: the cut applies even when pi could never compact -------------
 fs.writeFileSync(path.join(dir, ".pi", "memory", "sess-fail.json"), JSON.stringify({ enabled: true }));
-const s10 = boot("sess-fail", { compactOk: false });
+const s10 = boot("sess-fail");
 await s10.events.session_start({}, s10.ctx);
 assert.equal(s10.activeTools.includes("wake_defer"), true, "wake_defer declared after opt-in");
 await s10.tools.self_compact.execute("f1", { summary: "mid-flight checkpoint", continueAfter: false }, undefined, undefined, s10.ctx);
+assert.equal(s10.readMemory().pendingCompaction?.summary, "mid-flight checkpoint", "checkpoint queued at tool time");
 await s10.events.agent_end({}, s10.ctx);
-assert.equal(s10.compactCalls.length, 1, "compaction attempted at turn end");
-assert.equal(s10.readMemory().pendingCompaction, null, "failed checkpoint is not re-queued");
-const failSteer = s10.sent.map((s) => s.msg).find((m) => /self_propagation_compaction_failed/.test(m)) ?? "";
-assert.match(failSteer, /NOT applied/i, "agent is told the checkpoint did not happen");
-assert.match(failSteer, /retained/i, "agent is told the history was retained");
-assert.match(failSteer, /Nothing to compact/, "pi's refusal reason is surfaced to the agent");
-assert.match(failSteer, /do NOT retry immediately/i, "agent is told not to retry while too small");
-assert.equal(s10.sent.at(-1).opts.deliverAs, "steer", "the correction rides a steer so it starts a turn");
-assert.match(notified(s10), /Self-compaction failed/, "user is notified of the failure");
+assert.equal(s10.readMemory().pendingCompaction, null, "checkpoint applied at turn end");
+assert.ok(s10.readMemory().cut, "cut boundary persisted — no pi compaction involved");
+assert.match(s10.readMemory().cut.checkpoint, /mid-flight checkpoint/, "agent summary baked into the checkpoint");
+const failMsgs = BRANCH.map((e) => e.message);
+const failElided = await s10.events.context({ messages: failMsgs }, s10.ctx);
+assert.equal(failElided.messages.length, 1, "pre-cut history elided even for a tiny session");
+assert.equal(failElided.messages[0].role, "compactionSummary", "checkpoint rides the head");
+assert.match(failElided.messages[0].summary, /mid-flight checkpoint/, "checkpoint content shipped to the model");
 
 // ---- Phase 10: wake deferral ---------------------------------------------------
 const s11 = boot("sess-defer");
@@ -347,7 +358,7 @@ assert.equal(s11.readMemory().wakeDeferredUntil, 0, "cleared again for later pha
 // ============================================================================
 {
   // Big prefix: 28k tokens vs the 15k bootstrap floor => gate = 25k => over.
-  const s13 = boot("s13b", { tokens: 28000, branch: BRANCH_BIG });
+  const s13 = boot("s13b", { tokens: 28000 });
   await s13.commands["self-propagate"].handler("on", s13.ctx);
   await s13.commands["self-propagate"].handler("budget 0.5", s13.ctx); // headroom so 28k < ceiling
   await s13.tools.wake_defer.execute("g1", { minutes: 300, summary: "waiting for the CI run to finish" }, undefined, undefined, s13.ctx);
@@ -367,19 +378,6 @@ assert.equal(s11.readMemory().wakeDeferredUntil, 0, "cleared again for later pha
   assert.equal(d.details.autoCompaction, undefined, "no second compaction overwrites the first");
 }
 
-// ---- Phase 10d — over the prefix gate but a thin raw tail (right after a
-// compaction): pi would refuse, so no shrink is queued, ever ---------------
-{
-  const s15 = boot("s15b", { tokens: 28000 }); // default tiny BRANCH: ~30 tokens of raw history
-  await s15.commands["self-propagate"].handler("on", s15.ctx);
-  await s15.commands["self-propagate"].handler("budget 0.5", s15.ctx);
-  const d = await s15.tools.wake_defer.execute("n1", { minutes: 90, summary: "waiting" }, undefined, undefined, s15.ctx);
-  assert.notEqual(d.details.autoCompaction, true, "below pi's ~20k raw-tail floor => no auto-compaction");
-  assert.equal(s15.readMemory().pendingCompaction, null, "nothing queued below the floor");
-  assert.match(d.content[0].text, /~20k/, "the deferral message explains pi's floor");
-  assert.ok(s15.readMemory().wakeDeferredUntil > Date.now() + 89 * 60_000, "the deferral itself is still honored");
-}
-
 // ---- Phase 11: the protocol head states the numeric ceiling, byte-stably --------
 const s12 = boot("sess-ceiling", { model: { contextWindow: 200000 } });
 await s12.events.session_start({}, s12.ctx);
@@ -395,7 +393,7 @@ assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or
 
 // ---- Phase 10c — legacy memory file (no floor field) still gates correctly ----
 {
-  const s14 = boot("s14b", { tokens: 28000, branch: BRANCH_BIG });
+  const s14 = boot("s14b", { tokens: 28000 });
   await s14.commands["self-propagate"].handler("on", s14.ctx);
   const legacy = s14.readMemory();
   delete legacy.cacheFloorTokens; // simulate a file written by pre-floor code

@@ -35,14 +35,6 @@ const RECLAIM_MARGIN_TOKENS = 5_000;
 // absolute keeps a 25k+ prefix shrinking (the user's number); the relative keeps
 // the gate from firing forever when the floor itself is 25k+ (a fat tool head).
 const PRESSURE_ABS_TOKENS = 25_000;
-// pi refuses compaction when the RAW history since the last compaction can't
-// cover its keepRecentTokens floor (default 20k estimated tokens, chars/4 —
-// NOT the usage-based prefix). A full-wipe checkpoint below this floor is a
-// guaranteed refusal, so the automatic shrink paths won't attempt it. If a
-// deployment lowers compaction.keepRecentTokens in pi settings, this constant
-// won't follow it; compaction just gets skipped a little longer than needed.
-const PI_MIN_COMPACTABLE_TOKENS = 20_000;
-const RETAIN_NONE_SENTINEL = "__self_propagate_retain_none__";
 
 // Static protocol text appended to every system prompt. MUST stay byte-identical
 // across turns and compactions: pi sends a forced prompt as the leading system
@@ -63,9 +55,8 @@ function renderProtocolBlock(ctx: ExtensionContext, persisted: PersistedSessionS
     `- Effective context budget: ${Math.round(ceiling / 1000)}k tokens (${Math.round(persisted.budgetRatio * 100)}% of the ${Math.round(window / 1000)}k-token model window). [Context: ...] tool tags, the footer and <self_propagate_budget> alerts are percentages of THIS ceiling; pi's own context bar is a percentage of the full window — never mix the two.\n` +
     `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
     `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
-    `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps. If pi refuses the compaction (its error is reported to you), your history is retained — do not believe a checkpoint happened, and retry self_compact later if you still need it.\n` +
-    `- Reported token usage includes the post-compact floor (system+tools+checkpoint) — that part is NOT yours to shed; only raw history is. pi refuses compaction outright while fewer than ~20k estimated tokens of raw history have accumulated since the last compaction, so do not call \`self_compact\` (or expect one to be auto-queued) below that floor.\n` +
-    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat, compactable prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 5k+ above the post-compact floor, if larger) and ~20k+ of raw history has accumulated since the last compaction — one planned bust, then it holds the full deferral (any duration; 0 clears); below pi's ~20k raw-history floor no shrink is possible, only the deferral; at the floor, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
+    `- When calling \`self_compact\`, your window is cut down to your checkpoint: your \`summary\` plus the session goal and working memory ride the head of every future request. Your \`summary\` must contain all active state, modified files, and next steps. The transcript file is untouched — earlier turns stay visible to the user; only your window shrinks.\n` +
+    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 5k+ above the post-compact floor, if larger) — one planned bust, then it holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
   );
 }
 
@@ -94,6 +85,7 @@ interface PersistedSessionState {
   // Durable across restarts so a restart cannot escape the grace lock or lose a
   // queued checkpoint. Ephemeral execution flags (isBusy/isCompacting) are NOT here.
   pendingCompaction: PendingCompaction | null;
+  cut: CutCheckpoint | null;
   overBudgetTurns: number;
   idleCompactWarned: boolean;
   wakeDeferredUntil: number; // epoch ms; 0 = not deferred
@@ -105,6 +97,18 @@ interface PendingCompaction {
   keepFirstTurns: number;
   continueAfter: boolean;
   nextObjective?: string;
+}
+
+// An applied self-propagate checkpoint. The elision runs in the `context`
+// hook: every provider request carries [checkpoint] + messages since the cut,
+// so nothing pi-side is involved. The raw transcript is untouched — history
+// stays in the file and in the TUI; only the model's window is cut down.
+interface CutCheckpoint {
+  checkpoint: string; // rendered <pinned_context>/<working_memory>/<compaction_summary> block
+  prefixCount: number; // visible (non-system) messages in context at cut time
+  anchorRole: string; // role of the last visible message included in the cut
+  anchorSample: string; // its last ~200 chars, for validation before eliding
+  createdAt: string;
 }
 
 interface RuntimeState {
@@ -132,6 +136,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       pinnedContext: null,
       kv: {},
       pendingCompaction: null,
+      cut: null,
       overBudgetTurns: 0,
       idleCompactWarned: false,
       wakeDeferredUntil: 0,
@@ -179,6 +184,22 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
                   typeof rawPc.nextObjective === "string" ? rawPc.nextObjective : undefined,
               }
             : null;
+        const rawCut = raw.cut;
+        const cut: CutCheckpoint | null =
+          rawCut &&
+          typeof rawCut.checkpoint === "string" &&
+          Number.isFinite(Number(rawCut.prefixCount)) &&
+          typeof rawCut.anchorRole === "string" &&
+          typeof rawCut.anchorSample === "string"
+            ? {
+                checkpoint: rawCut.checkpoint,
+                prefixCount: Math.max(0, Math.floor(Number(rawCut.prefixCount))),
+                anchorRole: rawCut.anchorRole,
+                anchorSample: rawCut.anchorSample,
+                createdAt:
+                  typeof rawCut.createdAt === "string" ? rawCut.createdAt : new Date().toISOString(),
+              }
+            : null;
         const rawPin = raw.pinnedContext;
         const pinSource: PinnedContext["source"] =
           rawPin?.source === "user" || rawPin?.source === "agent" || rawPin?.source === "seed"
@@ -204,6 +225,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           pinnedContext,
           kv: raw.kv && typeof raw.kv === "object" ? raw.kv : {},
           pendingCompaction,
+          cut,
           overBudgetTurns: Math.max(0, Math.floor(Number(raw.overBudgetTurns) || 0)),
           idleCompactWarned: Boolean(raw.idleCompactWarned ?? false),
           wakeDeferredUntil: Math.max(0, Math.floor(Number(raw.wakeDeferredUntil) || 0)),
@@ -226,6 +248,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       pinnedContext: null,
       kv: {},
       pendingCompaction: null,
+      cut: null,
       overBudgetTurns: 0,
       idleCompactWarned: false,
       wakeDeferredUntil: 0,
@@ -303,79 +326,83 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     return `<working_memory count="${entries.length}">\n${items}\n</working_memory>`;
   }
 
-  // --- Context Budget Accounting ---
-  // Rough chars/4 estimate of one transcript entry's context-visible size,
-  // mirroring pi's estimateTokens (text/thinking/toolCall/user/toolResult).
-  // Invisible entries (compaction, context_edit, model_change, …) count 0.
-  function estimateEntryTokens(entry: any): number {
-    if (!entry || typeof entry !== "object") return 0;
-    const contentChars = (c: any): number => {
-      if (typeof c === "string") return c.length;
-      if (!Array.isArray(c)) return 0;
-      let chars = 0;
-      for (const b of c) {
-        if (typeof b?.text === "string") chars += b.text.length;
-        else if (b?.type === "image") chars += 4800;
-        else chars += JSON.stringify(b ?? null).length;
-      }
-      return chars;
-    };
-    if (entry.type !== "message" || !entry.message) return 0;
-    const m = entry.message;
-    switch (m.role) {
-      case "user":
-      case "toolResult":
-      case "custom":
-        return contentChars(m.content) / 4;
-      case "bashExecution":
-        return ((m.command?.length ?? 0) + (m.output?.length ?? 0)) / 4;
-      case "branchSummary":
-      case "compactionSummary":
-        return (m.summary?.length ?? 0) / 4;
-      case "assistant": {
-        let chars = 0;
-        for (const b of m.content ?? []) {
-          if (b?.type === "text") chars += b.text?.length ?? 0;
-          else if (b?.type === "thinking") chars += b.thinking?.length ?? 0;
-          else if (b?.type === "toolCall")
-            chars +=
-              (b.name?.length ?? 0) + JSON.stringify(b.arguments ?? {}).length;
-        }
-        return chars / 4;
-      }
-      default:
-        return 0;
+  // --- Context Cut Mechanism (replaces pi's compaction entirely) ---
+  // Serialize a message to matchable text — mirrors the branch serializer,
+  // so samples taken at cut time match the projected context messages.
+  function messageSample(m: any): string {
+    if (!m) return "";
+    if (typeof m.content === "string") return m.content;
+    if (Array.isArray(m.content)) {
+      return m.content
+        .map((b: any) => {
+          if (typeof b?.text === "string") return b.text;
+          if (typeof b?.thinking === "string") return b.thinking;
+          if (b?.type === "toolCall")
+            return JSON.stringify({ name: b.name, arguments: b.arguments });
+          if (b?.type === "image") return "[image]";
+          return JSON.stringify(b ?? "");
+        })
+        .join("\n");
     }
+    if (typeof m.output === "string") return `${m.command ?? ""}\n${m.output}`;
+    if (typeof m.summary === "string") return m.summary;
+    return "";
   }
 
-  // Estimated tokens of the raw tail AFTER the last compaction entry —
-  // exactly the basis pi measures its compaction floor on. Unmeasurable
-  // (no/branch unavailable) → Infinity: let pi make the call rather than
-  // block a possibly-valid shrink forever.
-  function estimateTailTokens(ctx: ExtensionContext): number {
-    const branch: any[] = ctx.sessionManager?.getBranch?.() ?? [];
-    if (!Array.isArray(branch) || branch.length === 0) return Number.POSITIVE_INFINITY;
-    let boundary = -1;
+  // Count of context-visible (non-system) messages pi derives from a branch —
+  // mirrors sessionEntryToContextMessages(): message/custom_message/
+  // branch_summary/compaction entries yield 1 visible message each, system
+  // messages are excluded (pi restores the prompt separately).
+  function visibleMessageCount(branch: any[]): number {
+    let n = 0;
+    for (const e of branch ?? []) {
+      if (!e || typeof e !== "object") continue;
+      if (e.type === "message") {
+        if (e.message?.role === "system") continue;
+        n += 1;
+      } else if (
+        e.type === "custom_message" ||
+        e.type === "branch_summary" ||
+        e.type === "compaction"
+      ) {
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  // The branch's last context-visible message — used to validate that the
+  // stored cut boundary still lines up with the transcript at elision time.
+  function anchorOfBranch(branch: any[]): { role: string; sample: string } | null {
     for (let i = branch.length - 1; i >= 0; i--) {
-      if (branch[i]?.type === "compaction") { boundary = i; break; }
+      const e = branch[i];
+      if (!e || typeof e !== "object") continue;
+      let role: string | null = null;
+      let text = "";
+      if (e.type === "message" && e.message) {
+        if (e.message.role === "system") continue;
+        role = e.message.role;
+        text = messageSample(e.message);
+      } else if (e.type === "custom_message") {
+        role = "custom";
+        text = messageSample({ content: e.content ?? [] });
+      } else if (e.type === "branch_summary") {
+        role = "branchSummary";
+        text = String(e.summary ?? "");
+      } else if (e.type === "compaction") {
+        role = "compactionSummary";
+        text = String(e.summary ?? "");
+      }
+      if (role && text) return { role, sample: text.slice(-200) };
     }
-    let tokens = 0;
-    for (let i = boundary + 1; i < branch.length; i++) {
-      tokens += estimateEntryTokens(branch[i]);
-    }
-    return tokens;
+    return null;
   }
 
-  // Will pi's prepareCompaction find anything to cut? A full-wipe checkpoint
-  // below the floor is a guaranteed "Nothing to compact (session too small)".
-  function compactionViable(ctx: ExtensionContext): boolean {
-    try {
-      return estimateTailTokens(ctx) >= PI_MIN_COMPACTABLE_TOKENS;
-    } catch {
-      return true;
-    }
+  function checkpointMessage(cut: CutCheckpoint) {
+    return { role: "compactionSummary", summary: cut.checkpoint, timestamp: Date.now() };
   }
 
+  // --- Context Budget Accounting ---
   function getBudgetMetrics(ctx: ExtensionContext) {
     const usage = ctx.getContextUsage?.();
     const physicalWindow =
@@ -640,60 +667,121 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   }
 
   // --- Trigger Compaction Execution ---
+  // Render the checkpoint block. Degrades per-block: a broken renderer costs
+  // a tagged note in the checkpoint, never the whole cut.
+  function renderCheckpoint(
+    ctx: ExtensionContext,
+    job: PendingCompaction
+  ): { checkpoint: string; kvKeys: string[]; degraded: boolean } {
+    const problems: string[] = [];
+
+    let originBlock = "";
+    try {
+      originBlock = renderPinnedContextBlock(ctx, job.keepFirstTurns);
+    } catch (e) {
+      problems.push(`pinned context failed to render: ${errMsg(e)}`);
+    }
+
+    let memoryBlock = "";
+    try {
+      memoryBlock = renderWorkingMemoryBlock();
+    } catch (e) {
+      problems.push(`working memory failed to render: ${errMsg(e)}`);
+    }
+
+    let kvKeys: string[] = [];
+    try {
+      kvKeys = Object.keys(state.persisted.kv);
+    } catch {
+      kvKeys = [];
+    }
+
+    const problemNote = problems.length
+      ? `\n[self-propagate: checkpoint DEGRADED — ${problems.join("; ")}]\n`
+      : "";
+    if (problems.length > 0) {
+      ctx.ui?.notify?.(
+        `Self-propagate checkpoint rendered in degraded mode: ${problems.join("; ")}`,
+        "warning"
+      );
+    }
+
+    const checkpoint =
+      `${originBlock}` +
+      `${memoryBlock}\n\n` +
+      problemNote +
+      `<compaction_summary>\n${scrubContextTags(job.summary)}\n</compaction_summary>`;
+
+    return { checkpoint, kvKeys, degraded: problems.length > 0 };
+  }
+
+  // Apply the queued checkpoint NOW: record the cut boundary and let the
+  // `context` hook do the elision from here on. No pi compaction entry is
+  // written — the transcript file stays whole; the checkpoint is persisted in
+  // .pi/memory and the window shrinks on the next request.
+  function applyQueuedCut(ctx: ExtensionContext, job: PendingCompaction): void {
+    const { checkpoint, kvKeys, degraded } = renderCheckpoint(ctx, job);
+
+    const branch: any[] = ctx.sessionManager?.getBranch?.() ?? [];
+    const prefixCount = visibleMessageCount(branch);
+    const anchor = anchorOfBranch(branch);
+    if (prefixCount <= 0 || !anchor) {
+      // Nothing to cut — an empty history. Drop the checkpoint and move on.
+      state.persisted.pendingCompaction = null;
+      state.lastActiveAt = Date.now();
+      saveState(ctx);
+      updateFooterStatus(ctx);
+      ctx.ui?.notify?.("Self-compaction: history is empty — nothing to cut.", "info");
+      return;
+    }
+
+    const createdAt = new Date().toISOString();
+    state.persisted.cut = { checkpoint, prefixCount, anchorRole: anchor.role, anchorSample: anchor.sample, createdAt };
+    state.persisted.pendingCompaction = null;
+    state.persisted.overBudgetTurns = 0;
+    state.persisted.idleCompactWarned = false;
+    state.awaitingFloorMeasurement = true;
+    state.lastActiveAt = Date.now();
+
+    try {
+      (pi as any).appendEntry?.("self_propagate_checkpoint", {
+        createdAt,
+        continueAfter: job.continueAfter,
+        keepFirstTurns: job.keepFirstTurns,
+        nextObjective: job.nextObjective ?? null,
+        kvKeys,
+        degraded,
+        checkpointChars: checkpoint.length,
+      });
+    } catch {
+      // Audit marker only — elision lives in .pi/memory, not the session file.
+    }
+
+    saveState(ctx);
+    updateFooterStatus(ctx);
+
+    if (job.continueAfter) {
+      const resumeText =
+        `<self_propagation_resume>\n` +
+        `Context checkpoint complete. Working memory and summary are loaded in your checkpoint.\n` +
+        `Next objective: ${job.nextObjective || "Continue executing your plan from the checkpoint summary."}\n` +
+        `</self_propagation_resume>`;
+      pi.sendUserMessage(resumeText, { deliverAs: "steer" });
+    } else {
+      ctx.ui?.notify?.("Self-compaction complete (agent paused).", "info");
+    }
+  }
+
+  // Execute queued self_compact as soon as the agent turn settles
   function executeScheduledCompaction(ctx: ExtensionContext): void {
-    if (!state.persisted.pendingCompaction || state.isCompacting) return;
     const job = state.persisted.pendingCompaction;
+    if (!job || state.isCompacting) return;
     state.isCompacting = true;
-
-    ctx.compact({
-      customInstructions: "Self-propagation agent-authored checkpoint.",
-      onComplete: () => {
-        state.isCompacting = false;
-        state.persisted.pendingCompaction = null;
-        state.persisted.overBudgetTurns = 0;
-        state.persisted.idleCompactWarned = false;
-        state.lastActiveAt = Date.now();
-        saveState(ctx);
-        updateFooterStatus(ctx);
-
-        if (job.continueAfter) {
-          const resumeText =
-            `<self_propagation_resume>\n` +
-            `Context compaction complete. Working memory and summary are loaded in your checkpoint.\n` +
-            `Next objective: ${job.nextObjective || "Continue executing your plan from the checkpoint summary."}\n` +
-            `</self_propagation_resume>`;
-          pi.sendUserMessage(resumeText, { deliverAs: "steer" });
-        } else {
-          ctx.ui?.notify?.(
-            "Self-compaction complete (agent paused).",
-            "info"
-          );
-        }
-      },
-      onError: (err: unknown) => {
-        state.isCompacting = false;
-        state.persisted.pendingCompaction = null;
-        saveState(ctx);
-        const reason = err instanceof Error ? err.message : String(err);
-        ctx.ui?.notify?.(
-          `Self-compaction failed: ${reason}`,
-          "error"
-        );
-        // The agent was told "queued, conclude your turn" and may believe a
-        // checkpoint happened. Correct the record: nothing was wiped, the summary
-        // was not applied, and (for pi's "too small" refusal) an immediate retry
-        // would fail the same way.
-        pi.sendUserMessage(
-          `<self_propagation_compaction_failed reason="${reason}">\n` +
-          `Your self_compact checkpoint was NOT applied — pi's compaction refused it: ${reason}.\n` +
-          `Your full conversation history is retained and your written summary was not baked in. ` +
-          `If the reason is "Nothing to compact (session too small)", the session is below pi's minimum compactable size: do NOT retry immediately; retry self_compact after context has grown. ` +
-          `Otherwise continue working — the checkpoint will be re-queued if you call self_compact again.\n` +
-          `</self_propagation_compaction_failed>`,
-          { deliverAs: "steer" }
-        );
-      },
-    });
+    try {
+      applyQueuedCut(ctx, job);
+    } finally {
+      state.isCompacting = false;
+    }
   }
 
   // --- Background Watchdog (Keep-Awake & Idle Compaction) ---
@@ -723,9 +811,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
         const idleMs = Date.now() - state.lastActiveAt;
         const { tokens, budgetPercent, floorTokens, historyTokens } = getBudgetMetrics(ctx);
-        // Below pi's ~20k raw-tail floor a shrink can't run — don't send the
-        // agent chasing a compaction that will be refused.
-        const pressure = overReclaimGate(ctx) && compactionViable(ctx);
+        const pressure = overReclaimGate(ctx);
 
         // Two lean message shapes; the pressure one turns the (likely already
         // happened) eviction into a planned shrink: compact, then rest.
@@ -889,7 +975,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "self_compact",
     label: "Self Compact Context",
     description:
-      "Wipe raw conversation history and replace it with your own structured summary, the session goal (the standing mandate, re-baked verbatim), and persistent KV working memory. Pi refuses to compact — the call fails, history retained — while fewer than ~20k estimated tokens of raw history have accumulated since the last compaction; do not call below that threshold (reported usage includes the ~fixed post-compact floor, which is NOT compactable).",
+      "Cut your window down to your own structured summary, the session goal (the standing mandate, re-baked verbatim), and persistent KV working memory. The transcript file is untouched — earlier turns stay visible to the user; only your window shrinks.",
     parameters: {
       type: "object",
       properties: {
@@ -1067,7 +1153,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "wake_defer",
     label: "Defer Wake Ticks",
     description:
-      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: once ~20k tokens of raw history have accumulated since the last compaction AND the prefix is 25k+ (or 5k+ above the post-compact floor, if larger), a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); below pi's ~20k raw-history floor the shrink is impossible and the deferral is set anyway; if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
+      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: when the prefix is 25k+ (or 5k+ above the post-compact floor, if larger), a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
     parameters: {
       type: "object",
       properties: {
@@ -1104,9 +1190,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       // own self_compact this turn (continueAfter: true path), its summary wins.
       const tokens = getBudgetMetrics(ctx).tokens;
       const gateOver = overReclaimGate(ctx);
-      const canShrink = gateOver && compactionViable(ctx);
       let autoQueued = false;
-      if (mins > 0 && !state.persisted.pendingCompaction && canShrink) {
+      if (mins > 0 && !state.persisted.pendingCompaction && gateOver) {
         state.persisted.pendingCompaction = {
           summary:
             (typeof params.summary === "string" && params.summary.trim()) ||
@@ -1128,7 +1213,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
                 ? "Wake deferral cleared — ticks resume on the next idle interval."
                 : autoQueued
                   ? `Prefix ${Math.round(tokens / 1000)}k is above the post-compact floor, so a shrink compaction was queued before the sleep (one planned bust, then a minimal prefix). Deferral set for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Conclude your response now — no further tool calls.`
-                  : `Wake ticks deferred for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.${state.persisted.pendingCompaction ? " Your self_compact will run first; the deferral holds after." : gateOver ? ` Prefix is ${Math.round(tokens / 1000)}k but fewer than ~20k tokens of history have accumulated since the last compaction — pi refuses to compact below that floor, so no shrink was queued; the deferral is set regardless.` : " Prefix is at the floor — evictions are cheap, any duration is safe."}`,
+                  : `Wake ticks deferred for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.${state.persisted.pendingCompaction ? " Your self_compact will run first; the deferral holds after." : " Prefix is at the floor — evictions are cheap, any duration is safe."}`,
           },
         ],
         details: {
@@ -1779,78 +1864,46 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     };
   });
 
-  // Intercept compaction: suppress built-in auto-compact and inject agent's self_compact payload
-  pi.on("session_before_compact", async (event, ctx) => {
+  // Suppress pi's built-in auto-compaction; the checkpoint path never goes
+  // through it (it elides in the `context` hook instead). A hard API overflow
+  // still reaches pi as a backstop.
+  pi.on("session_before_compact", async (event, _ctx) => {
     if (!state.persisted.enabled) return;
-
-    // If Pi's internal threshold compaction fired without the agent calling self_compact, cancel it
-    // so the agent stays in direct control via the 50/75/100% warnings (unless it's a hard API overflow)
-    if (!state.persisted.pendingCompaction && event.reason === "threshold") {
+    if (event.reason === "threshold") {
       return { cancel: true };
     }
+  });
 
-    if (!state.persisted.pendingCompaction) return;
-
-    // Total handler: a failure here must never let pi fall back to its default
-    // compaction (which would silently drop the pinned context, the KV memory
-    // and the agent's checkpoint). Degrade per-block and tag the result instead.
-    const job = state.persisted.pendingCompaction;
-    const problems: string[] = [];
-
-    let originBlock = "";
-    try {
-      originBlock = renderPinnedContextBlock(ctx, job.keepFirstTurns);
-    } catch (e) {
-      problems.push(`pinned context failed to render: ${errMsg(e)}`);
+  // The elision: every provider request carries
+  // [checkpoint] + messages since the cut. pi's compaction is bypassed
+  // entirely — the transcript file stays whole; only the window shrinks.
+  // If the stored boundary no longer matches the transcript (fork, tree
+  // navigation, context edits), elide nothing rather than drop live messages:
+  // drop the cut (the checkpoint still rides this request's head) and let the
+  // user/agent re-establish it with a fresh self_compact once context grows.
+  pi.on("context", (event: any, ctx: ExtensionContext) => {
+    const cut = state.persisted.cut;
+    if (!cut) return;
+    const msgs: any[] = Array.isArray(event?.messages) ? event.messages : [];
+    const idx = cut.prefixCount - 1;
+    const last = idx >= 0 ? msgs[idx] : undefined;
+    const intact =
+      cut.prefixCount > 0 &&
+      msgs.length >= cut.prefixCount &&
+      !!last &&
+      last.role === cut.anchorRole &&
+      messageSample(last).endsWith(cut.anchorSample);
+    if (intact) {
+      return { messages: [checkpointMessage(cut), ...msgs.slice(cut.prefixCount)] };
     }
-
-    let memoryBlock = "";
-    try {
-      memoryBlock = renderWorkingMemoryBlock();
-    } catch (e) {
-      problems.push(`working memory failed to render: ${errMsg(e)}`);
-    }
-
-    let kvKeys: string[] = [];
-    try {
-      kvKeys = Object.keys(state.persisted.kv);
-    } catch {
-      kvKeys = [];
-    }
-
-    const problemNote = problems.length
-      ? `\n[self-propagate: checkpoint DEGRADED — ${problems.join("; ")}]\n`
-      : "";
-
-    if (problems.length > 0) {
-      ctx.ui?.notify?.(
-        `Self-propagate checkpoint rendered in degraded mode: ${problems.join("; ")}`,
-        "warning"
-      );
-    }
-
-    const compositeSummary =
-      `${originBlock}` +
-      `${memoryBlock}\n\n` +
-      problemNote +
-      `<compaction_summary>\n${scrubContextTags(job.summary)}\n</compaction_summary>`;
-
-    state.awaitingFloorMeasurement = true;
-    return {
-      compaction: {
-        summary: compositeSummary,
-        // Sentinel ID not matching any prior entry -> buildContextEntries retains 0 tail entries
-        firstKeptEntryId: RETAIN_NONE_SENTINEL,
-        tokensBefore: event.preparation.tokensBefore,
-        details: {
-          selfPropagated: true,
-          keepFirstTurns: job.keepFirstTurns,
-          pinSource: state.persisted.pinnedContext?.source ?? null,
-          kvKeys,
-          degraded: problems.length > 0,
-        },
-      },
-    };
+    const checkpoint = checkpointMessage(cut);
+    state.persisted.cut = null;
+    saveState(ctx);
+    ctx.ui?.notify?.(
+      "self-propagate: the cut boundary no longer matches the transcript (fork/navigation/context edit?) — the cut was dropped and history is not elided. The checkpoint still rides this request; a fresh self_compact re-establishes elision.",
+      "warning"
+    );
+    return { messages: [checkpoint, ...msgs] };
   });
 
   // Execute queued self_compact as soon as the agent turn settles
