@@ -313,6 +313,9 @@ await s11.commands["self-propagate"].handler("on", s11.ctx);
 await s11.commands["self-propagate"].handler("wake every 5", s11.ctx);
 await s11.tools.wake_defer.execute("d1", { minutes: 30 }, undefined, undefined, s11.ctx);
 assert.ok(s11.readMemory().wakeDeferredUntil > Date.now() + 29 * 60_000, "deferral persisted");
+const d1res = await s11.tools.wake_defer.execute("d1b", { minutes: 30 }, undefined, undefined, s11.ctx);
+assert.doesNotMatch(d1res.content[0].text, /capped/, "a 30m deferral (under the cap) is not flagged as capped");
+assert.match(d1res.content[0].text, /deferred for 30m/, "under-cap deferral reports the requested minutes");
 await s11.commands["self-propagate"].handler("status", s11.ctx);
 assert.match(notified(s11), /deferred 30m/, "status reports the deferral");
 await s11.tools.wake_defer.execute("d2", { minutes: 0 }, undefined, undefined, s11.ctx);
@@ -321,6 +324,13 @@ await s11.tools.wake_defer.execute("d3", { minutes: 20 }, undefined, undefined, 
 assert.ok(s11.readMemory().wakeDeferredUntil > Date.now(), "deferral re-set for the config test");
 await s11.commands["self-propagate"].handler("wake every 15", s11.ctx);
 assert.equal(s11.readMemory().wakeDeferredUntil, 0, "explicit user wake config clears the deferral");
+
+// A 150m request (the live-session failure mode) must clamp to the cache-TTL bound:
+const d4 = await s11.tools.wake_defer.execute("d4", { minutes: 150 }, undefined, undefined, s11.ctx);
+assert.ok(s11.readMemory().wakeDeferredUntil <= Date.now() + 51 * 60_000, "deferral is capped at the 50m cache-TTL bound");
+assert.ok(s11.readMemory().wakeDeferredUntil > Date.now() + 40 * 60_000, "the cap applied a real (50m) deferral, not zero");
+assert.equal(d4.details?.capped, true, "result flags that the request was capped");
+assert.match(d4.content[0].text, /capped from your 150m/, "agent is told its 150m request was capped");
 
 // ---- Phase 11: the protocol head states the numeric ceiling, byte-stably --------
 const s12 = boot("sess-ceiling", { model: { contextWindow: 200000 } });
@@ -333,6 +343,7 @@ assert.equal(p1.systemPrompt, p2.systemPrompt, "protocol head is byte-stable tur
 assert.match(p1.systemPrompt, /100k tokens/, "ceiling = 50% of the 200k window");
 assert.match(p1.systemPrompt, /pi's own context bar/i, "the two percentage bases are distinguished");
 assert.match(p1.systemPrompt, /wake_defer/, "deferral tool is documented in the protocol");
+assert.match(p1.systemPrompt, /call .self_compact. \(continueAfter: true\) FIRST/, "long-quiet recipe: compact before deferring");
 
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
 const leftovers = fs.readdirSync(path.join(dir, ".pi", "memory")).filter((f) => f.includes(".tmp."));

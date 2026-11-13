@@ -13,6 +13,10 @@ const MAX_PINNED_TURNS = 4;
 const MAX_ORIGIN_TURN_CHARS = 12000;
 const MAX_PIN_CHARS = 12000;
 const GRACE_TURNS_AT_100 = 5;
+// Prompt-cache TTL bound: a deferral longer than this would let the session go
+// silent past the 1h cache TTL and cold-start the next turn — the exact thing
+// the keep-awake tick exists to prevent. Ticks resume at the cap and re-warm.
+const MAX_DEFER_MINUTES = 50;
 const RETAIN_NONE_SENTINEL = "__self_propagate_retain_none__";
 
 // Static protocol text appended to every system prompt. MUST stay byte-identical
@@ -35,7 +39,7 @@ function renderProtocolBlock(ctx: ExtensionContext, persisted: PersistedSessionS
     `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
     `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
     `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps. If pi refuses the compaction (its error is reported to you), your history is retained — do not believe a checkpoint happened, and retry self_compact later if you still need it.\n` +
-    `- If you expect no substantive events for a while, call \`wake_defer\` with the minutes to silence keep-awake ticks until then (0 clears the deferral).`
+    `- Long quiet periods: if you expect no substantive events for a while, call \`self_compact\` (continueAfter: true) FIRST, then after resuming call \`wake_defer\` with the minutes (capped at ${MAX_DEFER_MINUTES}m — the prompt-cache TTL bound; 0 clears it). The warm-up ticks keep the local prompt cache alive, and a smaller post-compaction prefix makes any cache expiry much cheaper to rebuild.`
   );
 }
 
@@ -608,7 +612,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
               `<keep_awake_tick idle_minutes="${state.persisted.keepAwakeMinutes}" context_budget="${budgetPercent}%">\n` +
                 `Session wake tick triggered because no activity occurred for ${state.persisted.keepAwakeMinutes}m.\n` +
                 `Review your <working_memory> and current objectives. If context budget (${budgetPercent}%) is high, call self_compact.\n` +
-                `If you expect no substantive events for a while, call wake_defer with the minutes to silence ticks until then.\n` +
+                `If you expect no substantive events for a while, call wake_defer with the minutes to silence ticks until then (capped at ${MAX_DEFER_MINUTES}m — the cache TTL bound).\n` +
                 `</keep_awake_tick>`,
               { deliverAs: "steer" }
             );
@@ -631,7 +635,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
               `<idle_compaction_notice idle_minutes="${state.persisted.idleCompactMinutes}" context_budget="${budgetPercent}%">\n` +
                 `The session has been inactive for ${state.persisted.idleCompactMinutes} minutes at ${budgetPercent}% context budget.\n` +
                 `Persist any important notes via memoryUpserts and call self_compact({ continueAfter: false, ... }) now so the session is cleanly compacted while idle.\n` +
-                `If you expect no substantive events for a while, call wake_defer with the minutes to silence further notices.\n` +
+                `If you expect no substantive events for a while, call wake_defer with the minutes to silence further notices (capped at ${MAX_DEFER_MINUTES}m — the cache TTL bound).\n` +
                 `</idle_compaction_notice>`,
               { deliverAs: "steer" }
             );
@@ -942,7 +946,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "wake_defer",
     label: "Defer Wake Ticks",
     description:
-      "Silence self-propagate wake ticks (keep-awake and idle-compact) for N minutes; pass 0 to clear an active deferral. Use it when you expect no substantive events for a while so ticks do not burn context. The deferral persists across restarts and is shown in the footer/status.",
+      `Silence self-propagate wake ticks (keep-awake and idle-compact) for up to N minutes; pass 0 to clear an active deferral. The deferral is CAPPED at ${MAX_DEFER_MINUTES} minutes — the 1h prompt-cache TTL bound — so the session always gets a warm-up turn and can never go fully cold; re-defer after the warm-up tick if you are still waiting. For a long quiet period, prefer self_compact (continueAfter: true) in an earlier turn first so the cached prefix is small, then defer here. It persists across restarts and is shown in the footer/status.`,
     parameters: {
       type: "object",
       properties: {
@@ -969,20 +973,27 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           details: {},
         };
       }
-      state.persisted.wakeDeferredUntil = mins > 0 ? Date.now() + mins * 60_000 : 0;
+      // Cap at the cache-TTL bound: unbounded silence would let the prompt cache
+      // go stale, which is what the keep-awake ticks exist to prevent.
+      const effective = mins > 0 ? Math.min(mins, MAX_DEFER_MINUTES) : 0;
+      state.persisted.wakeDeferredUntil = effective > 0 ? Date.now() + effective * 60_000 : 0;
       saveState(ctx);
       updateFooterStatus(ctx);
+      const capNote =
+        effective < mins
+          ? ` (capped from your ${mins}m request — the ${MAX_DEFER_MINUTES}m cache-TTL bound; a warm-up tick will fire, and you may re-defer afterwards)`
+          : "";
       return {
         content: [
           {
             type: "text",
             text:
-              mins > 0
-                ? `Wake ticks deferred for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.`
+              effective > 0
+                ? `Wake ticks deferred for ${effective}m${capNote} (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.`
                 : "Wake deferral cleared — ticks resume on the next idle interval.",
           },
         ],
-        details: { deferredUntil: state.persisted.wakeDeferredUntil },
+        details: { deferredUntil: state.persisted.wakeDeferredUntil, capped: effective < mins },
       };
     },
   });
