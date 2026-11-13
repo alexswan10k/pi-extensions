@@ -3,6 +3,7 @@
 1. **Opt-In Session Gate (**`/propagate on`**)**
    - **Zero overhead when off:** On `session_start`, the extension checks `.pi/memory/<sessionId>.json`. If the session has not opted in, `pi.setActiveTools()` strips `self_compact` and `memory_store` from the active tool declarations (saving schema tokens) and all lifecycle hooks no-op.
    - Running `/propagate on` enables the extension for the current session, persists the flag to `.pi/memory/<sessionId>.json` (surviving `/reload` and `--resume`), and activates the tools and background watchdog.
+   - **DX:** bare `/propagate` (or `/propagate help`) prints full usage plus the current state; `/propagate status` renders a budget progress bar, the pinned-turn floor, the anchor, KV usage and timers. Subcommands and their arguments tab-complete, unknown subcommands fail with a pointer to `help`, and `/propagate on here` re-anchors mid-session (see §3).
 2. **Model-Relative Context Budget & 5-Turn Grace Lock**
    - Uses `ctx.getContextUsage()` to read the active model's native `contextWindow` and authoritative token count (including system prompt and tool schemas).
     - **Headroom Buffer:** Because hitting 100% of the *physical* model window would cause the LLM provider to reject the 5 grace turns with `context_length_exceeded`, the extension defines your **Effective Budget Ceiling** as `85%` of `ctx.model.contextWindow` by default (configurable via `/propagate budget <0.30-0.95>`).

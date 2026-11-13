@@ -75,12 +75,17 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   };
 
   // --- Persistence Helpers (.pi/memory/<sessionId>.json) ---
-  function getMemoryFilePath(ctx: ExtensionContext): string {
+  function currentSessionId(ctx: ExtensionContext): string {
     const sid =
       (ctx as any).sessionId ||
       ctx.sessionManager?.getSessionId?.() ||
       "default";
     state.sessionId = sid;
+    return sid;
+  }
+
+  function getMemoryFilePath(ctx: ExtensionContext): string {
+    const sid = currentSessionId(ctx);
     const dir = path.join(ctx.cwd || process.cwd(), ".pi", "memory");
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -603,20 +608,134 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   });
 
   // --- Commands: /propagate and /keep-awake ---
+  const PROPAGATE_SUBS = [
+    { value: "on", description: "Enable self-propagation for this session" },
+    { value: "on here", description: "Enable, anchoring pinned origin turns to your latest user message" },
+    { value: "off", description: "Disable; clears keep-awake and any queued compaction" },
+    { value: "status", description: "Full state: budget bar, pinned floor, anchor, KV store, timers" },
+    { value: "budget", description: "Set/show budget ceiling as fraction of model window (0.3–0.95, default 0.85)" },
+    { value: "idle", description: "Set/show idle-compaction warning minutes (0 = off, default 15)" },
+    { value: "help", description: "Show this help" },
+  ] as const;
+
+  function clampPct(n: number): number {
+    return Math.max(0, Math.min(100, n));
+  }
+
+  function renderBudgetBar(pct: number, width = 20): string {
+    const filled = Math.round((clampPct(pct) / 100) * width);
+    return "█".repeat(filled) + "░".repeat(width - filled);
+  }
+
+  function propagateStatusSummary(ctx: ExtensionContext): string {
+    const { budgetPercent } = getBudgetMetrics(ctx);
+    const kv = Object.keys(state.persisted.kv).length;
+    return `${state.persisted.enabled ? "ENABLED" : "DISABLED"} | ${budgetPercent}% of ceiling | KV ${kv}/${MAX_KV_ENTRIES} | keep-awake ${state.persisted.keepAwakeMinutes > 0 ? `${state.persisted.keepAwakeMinutes}m` : "off"} | anchor ${state.persisted.anchorEntryId ? "current turn" : "session start"}`;
+  }
+
+  function propagateStatusDetail(ctx: ExtensionContext): string {
+    const { tokens, physicalWindow, budgetCeiling, budgetPercent } =
+      getBudgetMetrics(ctx);
+    const kv = Object.keys(state.persisted.kv).length;
+    const anchor = state.persisted.anchorEntryId
+      ? `${state.persisted.anchorEntryId.slice(0, 12)}… (set via /propagate on here)`
+      : "session start (default)";
+    const tier =
+      budgetPercent >= 100
+        ? "OVER BUDGET — grace turns running"
+        : budgetPercent >= 75
+          ? "warning ≥75% — checkpoint soon"
+          : budgetPercent >= 50
+            ? "notice ≥50%"
+            : "healthy";
+    return [
+      "Self-Propagate",
+      `  State    ${state.persisted.enabled ? "ENABLED" : "DISABLED"}`,
+      `  Budget   ${renderBudgetBar(budgetPercent)} ${budgetPercent}%  (${tokens}/${Math.round(budgetCeiling)} tokens; window ${physicalWindow}, ceiling ${Math.round(state.persisted.budgetRatio * 100)}%) — ${tier}`,
+      `  Pinned   floor ${state.persisted.minPinnedTurns} turn(s) | anchor: ${anchor}`,
+      `  KV       ${kv}/${MAX_KV_ENTRIES} notes | file: .pi/memory/${currentSessionId(ctx).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`,
+      `  Timers   keep-awake ${state.persisted.keepAwakeMinutes > 0 ? `${state.persisted.keepAwakeMinutes}m` : "off"} | idle-compact warn ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"}`,
+    ].join("\n");
+  }
+
+  function propagateHelp(): string {
+    return [
+      "Self-Propagate — contextual self-compaction for long sessions",
+      "",
+      "When the budget fills, the agent writes its own checkpoint (summary + pinned",
+      "origin turns + KV working memory), wipes raw history, and resumes. Opt-in per",
+      "session; nothing is sent anywhere and nothing changes when disabled.",
+      "",
+      "Usage: /propagate [subcommand]",
+      "",
+      "  on [here]          Enable. `here` anchors pinned origin turns to your latest",
+      "                     user message (for mid-conversation); default pins from the",
+      "                     session root. Turn 1 is always pinned (hard floor).",
+      "  off                Disable; clears keep-awake, pending compaction, grace count.",
+      "  status             Full state: budget bar, pinned floor, anchor, KV, timers.",
+      "  budget <0.3-0.95>  Effective ceiling as fraction of model window (default 0.85).",
+      "                     No argument prints the current value.",
+      "  idle <minutes>     Warn + poke the agent when idle this long at ≥25% budget",
+      "                     (0 = off, default 15). No argument prints the current value.",
+      "  help               This help (also the default for bare /propagate).",
+      "",
+      "Related tooling",
+      "  /keep-awake <minutes|off>   Wake tick every N minutes of inactivity.",
+      "  self_compact, memory_store   Tools, only declared while enabled.",
+      "  .pi/memory/<session>.json    KV notes + flags; survives /reload and resume.",
+    ].join("\n");
+  }
+
   pi.registerCommand("propagate", {
     description:
-      "Opt-in or configure self-propagation for this session: /propagate [on [here]|off|status|budget <0.3-0.95>|idle <minutes>] — `on here` anchors pinned origin turns to your latest user message instead of the session root",
+      "Self-propagation for long sessions: /propagate help | on [here] | off | status | budget <0.3-0.95> | idle <minutes>",
+    getArgumentCompletions: (prefix: string) => {
+      const lower = prefix.toLowerCase();
+      const firstSpace = lower.indexOf(" ");
+      if (firstSpace === -1) {
+        const items = PROPAGATE_SUBS.filter((s) =>
+          s.value.startsWith(lower)
+        ).map((s) => ({ value: s.value, label: s.value, description: s.description }));
+        return items.length > 0 ? items : null;
+      }
+      const first = lower.slice(0, firstSpace).trim();
+      const rest = lower.slice(firstSpace + 1);
+      const suggest = (values: string[], describe: (v: string) => string) =>
+        values
+          .filter((v) => v.startsWith(rest))
+          .map((v) => ({ value: v, label: v, description: describe(v) }));
+      if (first === "on")
+        return suggest(["here"], () => "Anchor pinned origin turns to your latest user message");
+      if (first === "budget")
+        return suggest(["0.5", "0.7", "0.85", "0.9"], (v) => `Ceiling ${Math.round(parseFloat(v) * 100)}% of model window`);
+      if (first === "idle")
+        return suggest(["0", "5", "10", "15", "30"], (v) => (v === "0" ? "Disable idle warning" : `Warn after ${v}m idle`));
+      return null;
+    },
     handler: async (args, ctx) => {
       state.latestCtx = ctx;
-      const parts = (args || "").trim().split(/\s+/);
-      const sub = (parts[0] || "status").toLowerCase();
+      const parts = (args || "").trim().split(/\s+/).filter(Boolean);
+      const sub = (parts[0] || "help").toLowerCase();
+
+      if (sub === "help" || sub === "h" || sub === "?") {
+        ctx.ui.notify(`${propagateHelp()}\n\nCurrent: ${propagateStatusSummary(ctx)}`, "info");
+        return;
+      }
 
       if (sub === "on") {
+        const option = parts[1]?.toLowerCase();
+        if (option && option !== "here") {
+          ctx.ui.notify(
+            `Unknown option '${parts[1]}'. Did you mean \`/propagate on here\`?`,
+            "warning"
+          );
+          return;
+        }
         state.persisted.enabled = true;
         state.persisted.minPinnedTurns = Math.max(1, state.persisted.minPinnedTurns ?? 1);
 
         // `/propagate on here` pins from the latest user message in the branch
-        if (parts[1]?.toLowerCase() === "here") {
+        if (option === "here") {
           const branch = ctx.sessionManager?.getBranch?.() ?? [];
           const lastUserEntry = [...branch]
             .reverse()
@@ -630,7 +749,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         syncToolVisibility();
         updateFooterStatus(ctx);
         ctx.ui.notify(
-          `Self-propagation ENABLED (${state.persisted.anchorEntryId ? "anchored to current turn" : "anchored to session start"}, budget ceiling: ${Math.round(state.persisted.budgetRatio * 100)}% of model window).`,
+          `Self-propagation ENABLED (${state.persisted.anchorEntryId ? "anchor: current turn" : "anchor: session start"}, ceiling ${Math.round(state.persisted.budgetRatio * 100)}% of model window). /propagate status for details, /propagate help for usage.`,
           "info"
         );
         return;
@@ -644,11 +763,18 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         saveState(ctx);
         syncToolVisibility();
         updateFooterStatus(ctx);
-        ctx.ui.notify("Self-propagation DISABLED for this session.", "info");
+        ctx.ui.notify("Self-propagation DISABLED for this session. /propagate on to re-enable.", "info");
         return;
       }
 
-      if (sub === "budget" && parts[1]) {
+      if (sub === "budget") {
+        if (!parts[1]) {
+          ctx.ui.notify(
+            `Budget ceiling is ${Math.round(state.persisted.budgetRatio * 100)}% of model window. Set it with /propagate budget <0.3-0.95> (e.g. 0.85).`,
+            "info"
+          );
+          return;
+        }
         const val = parseFloat(parts[1]);
         if (isNaN(val) || val < 0.3 || val > 0.95) {
           ctx.ui.notify("Budget ratio must be between 0.30 and 0.95 (e.g. 0.85).", "warning");
@@ -661,7 +787,14 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         return;
       }
 
-      if (sub === "idle" && parts[1]) {
+      if (sub === "idle") {
+        if (!parts[1]) {
+          ctx.ui.notify(
+            `Idle compaction warning is ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"}. Set it with /propagate idle <minutes> (0 = off).`,
+            "info"
+          );
+          return;
+        }
         const mins = parseInt(parts[1], 10);
         if (isNaN(mins) || mins < 0) {
           ctx.ui.notify("Idle compact minutes must be >= 0.", "warning");
@@ -673,18 +806,35 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         return;
       }
 
-      const { tokens, physicalWindow, budgetCeiling, budgetPercent } =
-        getBudgetMetrics(ctx);
+      if (sub === "status" || sub === "s") {
+        ctx.ui.notify(propagateStatusDetail(ctx), "info");
+        return;
+      }
+
       ctx.ui.notify(
-        `Self-Propagate: ${state.persisted.enabled ? "ENABLED" : "DISABLED"} | Usage: ${budgetPercent}% (${tokens}/${budgetCeiling}, model max ${physicalWindow}) | KV: ${Object.keys(state.persisted.kv).length}/${MAX_KV_ENTRIES} | KeepAwake: ${state.persisted.keepAwakeMinutes}m | IdleCompact: ${state.persisted.idleCompactMinutes}m | MinPinned: ${state.persisted.minPinnedTurns} | Anchor: ${state.persisted.anchorEntryId ? state.persisted.anchorEntryId.slice(0, 8) : "session start"}`,
-        "info"
+        `Unknown subcommand '${parts[0]}'. Run /propagate help to see usage.`,
+        "warning"
       );
     },
   });
 
   pi.registerCommand("keep-awake", {
     description:
-      "Toggle keep-awake cron loop for this session: /keep-awake <minutes|off>",
+      "Keep-awake cron loop for this session: /keep-awake <minutes|off>",
+    getArgumentCompletions: (prefix: string) => {
+      const lower = prefix.toLowerCase();
+      const values: Array<[string, string]> = [
+        ["off", "Disable the keep-awake timer"],
+        ["5", "Wake after 5m idle"],
+        ["10", "Wake after 10m idle"],
+        ["15", "Wake after 15m idle"],
+        ["30", "Wake after 30m idle"],
+      ];
+      const items = values
+        .filter(([v]) => v.startsWith(lower))
+        .map(([value, description]) => ({ value, label: value, description }));
+      return items.length > 0 ? items : null;
+    },
     handler: async (args, ctx) => {
       state.latestCtx = ctx;
       const arg = (args || "").trim().toLowerCase();
