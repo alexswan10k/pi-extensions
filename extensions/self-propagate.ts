@@ -21,8 +21,15 @@ const GRACE_TURNS_AT_100 = 5;
 // reclaim margin. The floor self-calibrates from the first request after each
 // compaction and resets to the bootstrap on model switch, so the gate can never
 // fire forever at the floor (a flat absolute threshold would).
-const FLOOR_BOOTSTRAP_TOKENS = 15_000;
-const RECLAIM_MARGIN_TOKENS = 10_000;
+// Measured in the live notes session (Nov 13): post-compact floors of
+// 15.6k -> 20.7k as the KV/goal grew. Bootstrap just needs to be plausible
+// until the first measurement; the absolute below dominates meanwhile.
+const FLOOR_BOOTSTRAP_TOKENS = 20_000;
+// 5k of reclaimable history above the floor costs ~25-30s of cold prefill on
+// Apple Silicon (measured: 9.4s on a 20.7k floor prefix vs 78.6s on 25.9k) —
+// worth reclaiming. Wider margins would block the 25k-absolute half from
+// firing on a grown floor.
+const RECLAIM_MARGIN_TOKENS = 5_000;
 // The absolute half of the gate: re-reading 25k+ on Apple Silicon is minutes of
 // compute regardless of the floor. The gate is the LARGER of the two — the
 // absolute keeps a 25k+ prefix shrinking (the user's number); the relative keeps
@@ -50,7 +57,7 @@ function renderProtocolBlock(ctx: ExtensionContext, persisted: PersistedSessionS
     `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
     `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
     `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps. If pi refuses the compaction (its error is reported to you), your history is retained — do not believe a checkpoint happened, and retry self_compact later if you still need it.\n` +
-    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 10k+ above the post-compact floor, if larger) — one planned bust, then it holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
+    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 5k+ above the post-compact floor, if larger) — one planned bust, then it holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
   );
 }
 
@@ -971,7 +978,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "wake_defer",
     label: "Defer Wake Ticks",
     description:
-      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: if the prefix is 25k+ tokens (or 10k+ above the post-compact floor, if larger), a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
+      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: if the prefix is 25k+ tokens (or 5k+ above the post-compact floor, if larger), a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
     parameters: {
       type: "object",
       properties: {

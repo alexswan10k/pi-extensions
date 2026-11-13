@@ -371,7 +371,7 @@ assert.equal(p1.systemPrompt, p2.systemPrompt, "protocol head is byte-stable tur
 assert.match(p1.systemPrompt, /100k tokens/, "ceiling = 50% of the 200k window");
 assert.match(p1.systemPrompt, /pi's own context bar/i, "the two percentage bases are distinguished");
 assert.match(p1.systemPrompt, /wake_defer/, "deferral tool is documented in the protocol");
-assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 10k\+ above the post-compact floor/, "protocol teaches the relative pressure gate");
+assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or 5k\+ above the post-compact floor/, "protocol teaches the relative pressure gate");
 
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
 const leftovers = fs.readdirSync(path.join(dir, ".pi", "memory")).filter((f) => f.includes(".tmp."));
