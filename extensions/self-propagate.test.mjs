@@ -314,8 +314,9 @@ await s11.commands["self-propagate"].handler("wake every 5", s11.ctx);
 await s11.tools.wake_defer.execute("d1", { minutes: 30 }, undefined, undefined, s11.ctx);
 assert.ok(s11.readMemory().wakeDeferredUntil > Date.now() + 29 * 60_000, "deferral persisted");
 const d1res = await s11.tools.wake_defer.execute("d1b", { minutes: 30 }, undefined, undefined, s11.ctx);
-assert.doesNotMatch(d1res.content[0].text, /capped/, "a 30m deferral (under the cap) is not flagged as capped");
-assert.match(d1res.content[0].text, /deferred for 30m/, "under-cap deferral reports the requested minutes");
+assert.equal(d1res.details.autoCompaction, undefined, "prefix at the floor => no auto-compaction");
+assert.equal(s11.readMemory().pendingCompaction, null, "at-floor deferral queues nothing");
+assert.match(d1res.content[0].text, /deferred for 30m/, "deferral reports the requested minutes");
 await s11.commands["self-propagate"].handler("status", s11.ctx);
 assert.match(notified(s11), /deferred 30m/, "status reports the deferral");
 await s11.tools.wake_defer.execute("d2", { minutes: 0 }, undefined, undefined, s11.ctx);
@@ -325,12 +326,39 @@ assert.ok(s11.readMemory().wakeDeferredUntil > Date.now(), "deferral re-set for 
 await s11.commands["self-propagate"].handler("wake every 15", s11.ctx);
 assert.equal(s11.readMemory().wakeDeferredUntil, 0, "explicit user wake config clears the deferral");
 
-// A 150m request (the live-session failure mode) must clamp to the cache-TTL bound:
+// A 150m request applies IN FULL (no cap): at the floor, any sleep is cheap.
 const d4 = await s11.tools.wake_defer.execute("d4", { minutes: 150 }, undefined, undefined, s11.ctx);
-assert.ok(s11.readMemory().wakeDeferredUntil <= Date.now() + 51 * 60_000, "deferral is capped at the 50m cache-TTL bound");
-assert.ok(s11.readMemory().wakeDeferredUntil > Date.now() + 40 * 60_000, "the cap applied a real (50m) deferral, not zero");
-assert.equal(d4.details?.capped, true, "result flags that the request was capped");
-assert.match(d4.content[0].text, /capped from your 150m/, "agent is told its 150m request was capped");
+assert.ok(s11.readMemory().wakeDeferredUntil > Date.now() + 140 * 60_000, "150m deferral applies in full — no TTL cap");
+assert.ok(s11.readMemory().wakeDeferredUntil <= Date.now() + 151 * 60_000, "deferral is exactly the requested window");
+assert.equal(d4.details?.autoCompaction, undefined, "at-floor 150m sleep needs no compaction");
+await s11.tools.wake_defer.execute("d4c", { minutes: 0 }, undefined, undefined, s11.ctx);
+assert.equal(s11.readMemory().wakeDeferredUntil, 0, "cleared again for later phases");
+
+
+// ============================================================================
+// Phase 10b — the pressure gate at deferral time (local-cache pressure model)
+// ============================================================================
+{
+  // Big prefix: 28k tokens vs the 15k bootstrap floor => gate = 25k => over.
+  const s13 = boot("s13b", { tokens: 28000 });
+  await s13.commands["self-propagate"].handler("on", s13.ctx);
+  await s13.commands["self-propagate"].handler("budget 0.5", s13.ctx); // headroom so 28k < ceiling
+  await s13.tools.wake_defer.execute("g1", { minutes: 300, summary: "waiting for the CI run to finish" }, undefined, undefined, s13.ctx);
+  const m13 = s13.readMemory();
+  assert.ok(m13.wakeDeferredUntil > Date.now() + 290 * 60_000, "the 300m deferral the model asked for is honored in full");
+  assert.ok(m13.pendingCompaction, "over the gate => a shrink compaction is auto-queued");
+  assert.equal(m13.pendingCompaction.continueAfter, false, "auto-queue sleeps after shrinking, does not resume");
+  assert.match(m13.pendingCompaction.summary, /waiting for the CI run/, "the agent's own summary is used for the checkpoint");
+
+  // The agent that compacted FIRST (continueAfter: true) defers as-is: its summary wins.
+  await s13.tools.self_compact.execute("g2", { summary: "deliberate checkpoint: step 2 done", continueAfter: true }, undefined, undefined, s13.ctx);
+  const d = await s13.tools.wake_defer.execute("g3", { minutes: 120 }, undefined, undefined, s13.ctx);
+  const m13b = s13.readMemory();
+  assert.match(m13b.pendingCompaction.summary, /deliberate checkpoint/, "the agent's own self_compact summary is preserved");
+  assert.equal(m13b.pendingCompaction.continueAfter, true, "the agent chose to continue after its shrink");
+  assert.ok(m13b.wakeDeferredUntil > Date.now() + 110 * 60_000, "and the deferral still holds for the full request");
+  assert.equal(d.details.autoCompaction, undefined, "no second compaction overwrites the first");
+}
 
 // ---- Phase 11: the protocol head states the numeric ceiling, byte-stably --------
 const s12 = boot("sess-ceiling", { model: { contextWindow: 200000 } });
@@ -343,7 +371,7 @@ assert.equal(p1.systemPrompt, p2.systemPrompt, "protocol head is byte-stable tur
 assert.match(p1.systemPrompt, /100k tokens/, "ceiling = 50% of the 200k window");
 assert.match(p1.systemPrompt, /pi's own context bar/i, "the two percentage bases are distinguished");
 assert.match(p1.systemPrompt, /wake_defer/, "deferral tool is documented in the protocol");
-assert.match(p1.systemPrompt, /call .self_compact. \(continueAfter: true\) FIRST/, "long-quiet recipe: compact before deferring");
+assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 10k\+ above the post-compact floor/, "protocol teaches the relative pressure gate");
 
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
 const leftovers = fs.readdirSync(path.join(dir, ".pi", "memory")).filter((f) => f.includes(".tmp."));

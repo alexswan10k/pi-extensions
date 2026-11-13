@@ -13,10 +13,16 @@ const MAX_PINNED_TURNS = 4;
 const MAX_ORIGIN_TURN_CHARS = 12000;
 const MAX_PIN_CHARS = 12000;
 const GRACE_TURNS_AT_100 = 5;
-// Prompt-cache TTL bound: a deferral longer than this would let the session go
-// silent past the 1h cache TTL and cold-start the next turn — the exact thing
-// the keep-awake tick exists to prevent. Ticks resume at the cap and re-warm.
-const MAX_DEFER_MINUTES = 50;
+// Local-model cache reality: there is NO TTL — other local sessions evict this
+// session's KV cache via memory pressure, typically within 10-15m of silence, and
+// a bust costs a re-read of the WHOLE prefix. The rule is therefore: never let a
+// large prefix sit idle. "Large" is RELATIVE — the post-compact floor (system +
+// tools + checkpoint: the smallest prefix this session can possibly have) plus a
+// reclaim margin. The floor self-calibrates from the first request after each
+// compaction and resets to the bootstrap on model switch, so the gate can never
+// fire forever at the floor (a flat absolute threshold would).
+const FLOOR_BOOTSTRAP_TOKENS = 15_000;
+const RECLAIM_MARGIN_TOKENS = 10_000;
 const RETAIN_NONE_SENTINEL = "__self_propagate_retain_none__";
 
 // Static protocol text appended to every system prompt. MUST stay byte-identical
@@ -39,7 +45,7 @@ function renderProtocolBlock(ctx: ExtensionContext, persisted: PersistedSessionS
     `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
     `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
     `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps. If pi refuses the compaction (its error is reported to you), your history is retained — do not believe a checkpoint happened, and retry self_compact later if you still need it.\n` +
-    `- Long quiet periods: if you expect no substantive events for a while, call \`self_compact\` (continueAfter: true) FIRST, then after resuming call \`wake_defer\` with the minutes (capped at ${MAX_DEFER_MINUTES}m — the prompt-cache TTL bound; 0 clears it). The warm-up ticks keep the local prompt cache alive, and a smaller post-compaction prefix makes any cache expiry much cheaper to rebuild.`
+    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is ${RECLAIM_MARGIN_TOKENS / 1000}k+ above the post-compact floor, then holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
   );
 }
 
@@ -71,6 +77,7 @@ interface PersistedSessionState {
   overBudgetTurns: number;
   idleCompactWarned: boolean;
   wakeDeferredUntil: number; // epoch ms; 0 = not deferred
+  cacheFloorTokens: number; // measured post-compact prefix size (system+tools+checkpoint)
 }
 
 interface PendingCompaction {
@@ -85,6 +92,7 @@ interface RuntimeState {
   persisted: PersistedSessionState;
   isBusy: boolean;
   isCompacting: boolean;
+  awaitingFloorMeasurement: boolean; // measure the floor on the next request after a compaction
   lastActiveAt: number; // idle clock: reset at every session start, never persisted
   latestCtx: ExtensionContext | null;
 }
@@ -107,9 +115,11 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       overBudgetTurns: 0,
       idleCompactWarned: false,
       wakeDeferredUntil: 0,
+      cacheFloorTokens: FLOOR_BOOTSTRAP_TOKENS,
     },
     isBusy: false,
     isCompacting: false,
+    awaitingFloorMeasurement: false,
     lastActiveAt: Date.now(),
     latestCtx: null,
   };
@@ -288,6 +298,15 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       budgetCeiling,
       budgetPercent,
     };
+  }
+
+  // Pressure gate: is the current prefix meaningfully larger than the smallest
+  // prefix this session can have (post-compact floor + margin)?
+  function overReclaimGate(ctx: ExtensionContext): boolean {
+    return (
+      getBudgetMetrics(ctx).tokens >=
+      state.persisted.cacheFloorTokens + RECLAIM_MARGIN_TOKENS
+    );
   }
 
   function updateFooterStatus(ctx: ExtensionContext): void {
@@ -595,51 +614,51 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           return;
         }
 
-        // A deferral (agent or user) suppresses every wake mode until it expires.
+        // A deferral suppresses the routine wakes. Safe by construction: wake_defer
+        // auto-shrinks a large prefix at call time, so a sleeping prefix is at or
+        // below the reclaim gate — any cache eviction while asleep is a cheap re-read.
         if (Date.now() < state.persisted.wakeDeferredUntil) {
           return;
         }
 
         const idleMs = Date.now() - state.lastActiveAt;
+        const { tokens, budgetPercent } = getBudgetMetrics(ctx);
+        const pressure = overReclaimGate(ctx);
+
+        // Two lean message shapes; the pressure one turns the (likely already
+        // happened) eviction into a planned shrink: compact, then rest.
+        const pressureMsg =
+          `<keep_awake_tick pressure="1" tokens_k="${Math.round(tokens / 1000)}" floor_k="${Math.round(state.persisted.cacheFloorTokens / 1000)}">\n` +
+          `Prefix is above the post-compact floor — assume your KV cache is evicted. self_compact(continueAfter: false) now, then wake_defer if still waiting: sleeping on a small prefix is cheap.\n` +
+          `</keep_awake_tick>`;
+        const warmMsg =
+          `<keep_awake_tick budget="${budgetPercent}%">\n` +
+          `Idle ${state.persisted.keepAwakeMinutes || state.persisted.idleCompactMinutes}m. Check <working_memory>; act only if something changed.\n` +
+          `</keep_awake_tick>`;
 
         // Mode 1: Keep-Awake Cron
         if (state.persisted.keepAwakeMinutes > 0) {
-          const wakeMs = state.persisted.keepAwakeMinutes * 60_000;
-          if (idleMs >= wakeMs) {
+          if (idleMs >= state.persisted.keepAwakeMinutes * 60_000) {
             state.lastActiveAt = Date.now();
-            const { budgetPercent } = getBudgetMetrics(ctx);
-            pi.sendUserMessage(
-              `<keep_awake_tick idle_minutes="${state.persisted.keepAwakeMinutes}" context_budget="${budgetPercent}%">\n` +
-                `Session wake tick triggered because no activity occurred for ${state.persisted.keepAwakeMinutes}m.\n` +
-                `Review your <working_memory> and current objectives. If context budget (${budgetPercent}%) is high, call self_compact.\n` +
-                `If you expect no substantive events for a while, call wake_defer with the minutes to silence ticks until then (capped at ${MAX_DEFER_MINUTES}m — the cache TTL bound).\n` +
-                `</keep_awake_tick>`,
-              { deliverAs: "steer" }
-            );
+            pi.sendUserMessage(pressure ? pressureMsg : warmMsg, {
+              deliverAs: "steer",
+            });
           }
           return;
         }
 
-        // Mode 2: Idle Compaction Warning (only when wake-every is 0)
+        // Mode 2: Idle shrink notice (only when keep-awake is off): fires once
+        // per idle streak when the prefix is worth reclaiming.
         if (
           state.persisted.idleCompactMinutes > 0 &&
-          !state.persisted.idleCompactWarned
+          !state.persisted.idleCompactWarned &&
+          idleMs >= state.persisted.idleCompactMinutes * 60_000 &&
+          pressure
         ) {
-          const idleTargetMs = state.persisted.idleCompactMinutes * 60_000;
-          const { budgetPercent } = getBudgetMetrics(ctx);
-          if (idleMs >= idleTargetMs && budgetPercent >= 25) {
-            state.persisted.idleCompactWarned = true;
-            state.lastActiveAt = Date.now();
-            saveState(ctx);
-            pi.sendUserMessage(
-              `<idle_compaction_notice idle_minutes="${state.persisted.idleCompactMinutes}" context_budget="${budgetPercent}%">\n` +
-                `The session has been inactive for ${state.persisted.idleCompactMinutes} minutes at ${budgetPercent}% context budget.\n` +
-                `Persist any important notes via memoryUpserts and call self_compact({ continueAfter: false, ... }) now so the session is cleanly compacted while idle.\n` +
-                `If you expect no substantive events for a while, call wake_defer with the minutes to silence further notices (capped at ${MAX_DEFER_MINUTES}m — the cache TTL bound).\n` +
-                `</idle_compaction_notice>`,
-              { deliverAs: "steer" }
-            );
-          }
+          state.persisted.idleCompactWarned = true;
+          state.lastActiveAt = Date.now();
+          saveState(ctx);
+          pi.sendUserMessage(pressureMsg, { deliverAs: "steer" });
         }
       } catch {
         // Ignore stale context errors across reloads
@@ -946,13 +965,18 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "wake_defer",
     label: "Defer Wake Ticks",
     description:
-      `Silence self-propagate wake ticks (keep-awake and idle-compact) for up to N minutes; pass 0 to clear an active deferral. The deferral is CAPPED at ${MAX_DEFER_MINUTES} minutes — the 1h prompt-cache TTL bound — so the session always gets a warm-up turn and can never go fully cold; re-defer after the warm-up tick if you are still waiting. For a long quiet period, prefer self_compact (continueAfter: true) in an earlier turn first so the cached prefix is small, then defer here. It persists across restarts and is shown in the footer/status.`,
+      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: if the prefix is ${RECLAIM_MARGIN_TOKENS / 1000}k+ tokens above the post-compact floor, a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
     parameters: {
       type: "object",
       properties: {
         minutes: {
           type: "number",
           description: "Minutes of silence to defer (>= 0). 0 clears the deferral immediately.",
+        },
+        summary: {
+          type: "string",
+          description:
+            "Optional: what you are waiting for and the current state. Used as the checkpoint if this call auto-queues a shrink compaction.",
         },
       },
       required: ["minutes"],
@@ -973,27 +997,40 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           details: {},
         };
       }
-      // Cap at the cache-TTL bound: unbounded silence would let the prompt cache
-      // go stale, which is what the keep-awake ticks exist to prevent.
-      const effective = mins > 0 ? Math.min(mins, MAX_DEFER_MINUTES) : 0;
-      state.persisted.wakeDeferredUntil = effective > 0 ? Date.now() + effective * 60_000 : 0;
+      // The pressure gate is enforced AT DEFERRAL TIME, never mid-sleep: a large
+      // prefix cannot enter a long sleep unshrunk. If the agent already queued its
+      // own self_compact this turn (continueAfter: true path), its summary wins.
+      const tokens = getBudgetMetrics(ctx).tokens;
+      let autoQueued = false;
+      if (mins > 0 && !state.persisted.pendingCompaction && overReclaimGate(ctx)) {
+        state.persisted.pendingCompaction = {
+          summary:
+            (typeof params.summary === "string" && params.summary.trim()) ||
+            `Deferred ${mins}m for external events; history wiped to keep the sleeping prefix minimal. Resume state is in <working_memory>.`,
+          keepFirstTurns: 1,
+          continueAfter: false,
+        };
+        autoQueued = true;
+      }
+      state.persisted.wakeDeferredUntil = mins > 0 ? Date.now() + mins * 60_000 : 0;
       saveState(ctx);
       updateFooterStatus(ctx);
-      const capNote =
-        effective < mins
-          ? ` (capped from your ${mins}m request — the ${MAX_DEFER_MINUTES}m cache-TTL bound; a warm-up tick will fire, and you may re-defer afterwards)`
-          : "";
       return {
         content: [
           {
             type: "text",
             text:
-              effective > 0
-                ? `Wake ticks deferred for ${effective}m${capNote} (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.`
-                : "Wake deferral cleared — ticks resume on the next idle interval.",
+              mins === 0
+                ? "Wake deferral cleared — ticks resume on the next idle interval."
+                : autoQueued
+                  ? `Prefix ${Math.round(tokens / 1000)}k is above the post-compact floor, so a shrink compaction was queued before the sleep (one planned bust, then a minimal prefix). Deferral set for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Conclude your response now — no further tool calls.`
+                  : `Wake ticks deferred for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.${state.persisted.pendingCompaction ? " Your self_compact will run first; the deferral holds after." : " Prefix is at the floor — evictions are cheap, any duration is safe."}`,
           },
         ],
-        details: { deferredUntil: state.persisted.wakeDeferredUntil, capped: effective < mins },
+        details: {
+          deferredUntil: state.persisted.wakeDeferredUntil,
+          ...(autoQueued ? { autoCompaction: true } : {}),
+        },
       };
     },
   });
@@ -1494,6 +1531,13 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   });
 
   // --- Lifecycle Hooks ---
+  pi.on("model_change", (_event, ctx) => {
+    // A different model means a different system+tools head — the measured floor
+    // is stale. Reset to bootstrap; it re-calibrates on the next compaction.
+    state.persisted.cacheFloorTokens = FLOOR_BOOTSTRAP_TOKENS;
+    if (state.persisted.enabled) saveState(ctx);
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     state.latestCtx = ctx;
     state.isBusy = false;
@@ -1515,6 +1559,17 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     state.isBusy = true;
     state.persisted.idleCompactWarned = false;
     state.lastActiveAt = Date.now();
+
+    // Self-calibrating floor: the first request after a compaction measures the
+    // smallest prefix this session can have (system + tools + checkpoint).
+    if (state.awaitingFloorMeasurement) {
+      state.awaitingFloorMeasurement = false;
+      const n = ctx.getContextUsage?.()?.tokens ?? 0;
+      if (n > 0 && state.persisted.enabled) {
+        state.persisted.cacheFloorTokens = n;
+        saveState(ctx);
+      }
+    }
 
     if (!state.persisted.enabled) return;
 
@@ -1676,6 +1731,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       problemNote +
       `<compaction_summary>\n${scrubContextTags(job.summary)}\n</compaction_summary>`;
 
+    state.awaitingFloorMeasurement = true;
     return {
       compaction: {
         summary: compositeSummary,
