@@ -1,0 +1,284 @@
+#!/usr/bin/env bash
+# pi-extensions — list, install and uninstall the extensions in this package,
+# either en masse or one at a time, by editing Pi's settings.json correctly.
+#
+#   bin/pi-extensions                     list everything: what loads, what's stale
+#   bin/pi-extensions install all         load every extension (drop any filter)
+#   bin/pi-extensions install self-propagate
+#   bin/pi-extensions install ask-jev ringfence
+#   bin/pi-extensions uninstall ringfence   everything except ringfence keeps loading
+#   bin/pi-extensions uninstall all         remove the package entry entirely
+#   bin/pi-extensions -l install all        operate on .pi/settings.json (project)
+#   bin/pi-extensions --agent-dir DIR …     override ~/.pi/agent (testing)
+#
+# Names are the extension file basenames: workspace-swarm, ringfence, ask-jev,
+# self-propagate. "extensions/x.ts" and "x.ts" are accepted too.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+AGENT_DIR="${PI_AGENT_DIR:-$HOME/.pi/agent}"
+SCOPE="global"
+ARGS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -l|--project) SCOPE="project"; shift ;;
+    --agent-dir) AGENT_DIR="$2"; shift 2 ;;
+    -h|--help) sed -n '2,20p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+
+export REPO_ROOT AGENT_DIR SCOPE
+set +u
+export PI_EXT_ARGS="$(printf '%s\n' "${ARGS[@]}")"
+set -u
+
+node <<'EOF'
+const fs = require("fs");
+const path = require("path");
+const cp = require("child_process");
+
+const REPO_ROOT = process.env.REPO_ROOT;
+const AGENT_DIR = process.env.AGENT_DIR;
+const SCOPE = process.env.SCOPE;
+const argv = (process.env.PI_EXT_ARGS || "").split("\n").filter(Boolean);
+const cmd = (argv[0] || "list").toLowerCase();
+const nameArgs = argv.slice(1);
+
+const SOURCE = "git:github.com/alexswan10k/pi-extensions";
+const REMOTE_URL = "https://github.com/alexswan10k/pi-extensions.git";
+const INSTALL_DIR = path.join(AGENT_DIR, "git/github.com/alexswan10k/pi-extensions");
+const SETTINGS = SCOPE === "project" ? path.join(process.cwd(), ".pi/settings.json") : path.join(AGENT_DIR, "settings.json");
+
+// ---- discovery ---------------------------------------------------------------
+const extDir = path.join(REPO_ROOT, "extensions");
+const NAMES = fs.readdirSync(extDir)
+  .filter((f) => f.endsWith(".ts") && !f.endsWith(".test.ts"))
+  .map((f) => f.replace(/\.ts$/, ""))
+  .sort();
+const DESCRIPTIONS = {
+  "workspace-swarm": "HTTP group chat / agent bus per workspace",
+  "ringfence": "Default-deny guardrail around the workspace",
+  "ask-jev": "Yes/no, pick-one and rate judgements from the local LM Studio decision model",
+  "self-propagate": "Agent-authored context self-compaction + KV working memory (/propagate, /keep-awake)",
+};
+const PATH_OF = (n) => `extensions/${n}.ts`;
+
+function normalizeName(raw) {
+  let n = raw.trim().replace(/^\.\//, "").replace(/^extensions\//, "").replace(/\.ts$/, "");
+  n = n.toLowerCase();
+  return NAMES.find((k) => k.toLowerCase() === n) || null;
+}
+
+// ---- settings file IO ----------------------------------------------------------
+function readSettings() {
+  if (!fs.existsSync(SETTINGS)) return null; // not configured at all
+  try {
+    return JSON.parse(fs.readFileSync(SETTINGS, "utf8"));
+  } catch (e) {
+    console.error(`error: cannot parse ${SETTINGS}: ${e.message}`);
+    process.exit(2);
+  }
+}
+function writeSettings(obj) {
+  const dir = path.dirname(SETTINGS);
+  fs.mkdirSync(dir, { recursive: true });
+  if (fs.existsSync(SETTINGS)) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    fs.copyFileSync(SETTINGS, `${SETTINGS}.bak-${stamp}`);
+  }
+  fs.writeFileSync(SETTINGS, JSON.stringify(obj, null, 2) + "\n");
+}
+function findEntryIndex(packages) {
+  return (packages || []).findIndex((p) => {
+    const src = typeof p === "string" ? p : p && p.source;
+    return typeof src === "string" && src.includes("alexswan10k/pi-extensions");
+  });
+}
+function entryOf(p) {
+  return typeof p === "string" ? { source: p } : { ...p };
+}
+
+// ---- filter semantics (mirrors applyPatterns in pi's package-manager) ---------
+function globToRegExp(glob) {
+  const esc = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  return new RegExp("^" + esc.replace(/\*/g, ".*").replace(/\?/g, ".") + "$");
+}
+const norm = (s) => s.replace(/^\.\//, "");
+const matchesAny = (file, patterns) =>
+  patterns.some((p) => globToRegExp(norm(p)).test(file) || globToRegExp(norm(p)).test(path.posix.basename(file)));
+function enabledSet(entry, names) {
+  const files = names.map(PATH_OF);
+  if (!entry) return new Set();
+  const f = entry.extensions;
+  if (f === undefined) return new Set(names); // no filter: load everything
+  if (!Array.isArray(f)) return new Set(names); // defensive: malformed means everything
+  if (f.length === 0) return new Set(); // [] explicitly disables all (pi semantics)
+  const plain = [], excl = [], forceInc = [], forceExc = [];
+  for (const r of f) {
+    if (typeof r !== "string") continue;
+    if (r.startsWith("!")) excl.push(r.slice(1));
+    else if (r.startsWith("+")) forceInc.push(r.slice(1));
+    else if (r.startsWith("-")) forceExc.push(r.slice(1));
+    else plain.push(r);
+  }
+  let result = plain.length ? files.filter((f) => matchesAny(f, plain)) : [...files];
+  if (excl.length) result = result.filter((f) => !matchesAny(f, excl));
+  if (forceInc.length) for (const f of files) if (!result.includes(f) && forceInc.some((p) => norm(p) === f)) result.push(f);
+  if (forceExc.length) result = result.filter((f) => !forceExc.some((p) => norm(p) === f));
+  return new Set(result.map((f) => f.replace(/^extensions\//, "").replace(/\.ts$/, "")));
+}
+function filterDescription(entry) {
+  if (!entry) return "not installed";
+  const f = entry.extensions;
+  if (f === undefined) return "everything (no filter)";
+  if (Array.isArray(f) && f.length === 0) return "nothing (empty filter)";
+  return `filtered: [${(f || []).join(", ")}]`;
+}
+
+// ---- reporting helpers -----------------------------------------------------------
+function gitShort(dir) {
+  try { return cp.execSync(`git -C "${dir}" rev-parse HEAD`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); }
+  catch { return null; }
+}
+function remoteMain() {
+  try {
+    const out = cp.execSync(`GIT_HTTP_LOW_SPEED_LIMIT=1000 GIT_HTTP_LOW_SPEED_TIME=8 git ls-remote "${REMOTE_URL}" refs/heads/main`, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return out.split("\t")[0] || null;
+  } catch { return null; }
+}
+function settingsColumn(label, entry, names) {
+  const en = enabledSet(entry, names);
+  const list = NAMES.map((n) => (en.has(n) ? n : null)).filter(Boolean);
+  const state = !entry ? "not configured" : (en.size === NAMES.length ? "all four" : list.length ? list.join(", ") : "none");
+  console.log(`  ${label.padEnd(9)} ${state}`);
+  return en;
+}
+
+function showList() {
+  console.log("pi-extensions — extensions in this package\n");
+  const settings = readSettings();
+  const idx = findEntryIndex(settings && settings.packages);
+  const globalEntry = idx >= 0 ? entryOf(settings.packages[idx]) : null;
+
+  console.log(`source    ${SOURCE}`);
+  console.log(`scope     ${SCOPE} (${SETTINGS})`);
+  if (globalEntry) {
+    console.log(`filter    ${filterDescription(globalEntry)}`);
+  } else {
+    console.log(`filter    ${SCOPE === "project" ? "not configured in this project" : "not configured globally"}`);
+  }
+  const installed = gitShort(INSTALL_DIR);
+  const repoHead = gitShort(REPO_ROOT);
+  console.log(`checkout  ${installed ? installed.slice(0, 10) : "not installed"} (this repo: ${repoHead ? repoHead.slice(0, 10) : "?"})`);
+  if (installed) {
+    const remote = remoteMain();
+    if (!remote) console.log(`remote    check failed (offline?)`);
+    else if (remote === installed) console.log(`remote    up to date (main ${remote.slice(0, 10)})`);
+    else console.log(`remote    UPDATE AVAILABLE (main ${remote.slice(0, 10)} ≠ installed ${installed.slice(0, 10)}) — run: pi update --extensions`);
+  }
+  console.log("");
+  const width = Math.max(...NAMES.map((n) => n.length));
+  for (const n of NAMES) {
+    console.log(`  ${n.padEnd(width)}  ${DESCRIPTIONS[n] || ""}`);
+  }
+  console.log("");
+  const en = settingsColumn(SCOPE, globalEntry, NAMES);
+  console.log("");
+  console.log("hint      pi-extensions install all | install <name...> | uninstall <name...> | uninstall all");
+  console.log("          -l for project scope (.pi/settings.json); restart pi or /reload after changes");
+}
+
+function loadPackages(settings) {
+  const packages = Array.isArray(settings && settings.packages) ? [...settings.packages] : [];
+  return packages;
+}
+const normPath = (p) => norm(p);
+function applyAndReport(packages, message) {
+  const settings = readSettings() || {};
+  settings.packages = packages;
+  writeSettings(settings);
+  const idx = findEntryIndex(settings.packages);
+  const entry = idx >= 0 ? entryOf(settings.packages[idx]) : null;
+  const en = entry ? [...enabledSet(entry, NAMES)] : [];
+  console.log(message);
+  console.log(`now loads (${SCOPE}): ${en.length ? en.join(", ") : "nothing"}`);
+  console.log(`settings: ${SETTINGS} (backup written next to it)`);
+  console.log("restart pi or /reload in live sessions to apply.");
+}
+
+function cmdInstall(names) {
+  const settings = readSettings() || {};
+  const packages = loadPackages(settings);
+  const idx = findEntryIndex(packages);
+
+  if (names.length === 0) {
+    console.error("usage: pi-extensions install all | install <name...>");
+    process.exit(1);
+  }
+  if (names.length === 1 && names[0].toLowerCase() === "all") {
+    if (idx >= 0) packages[idx] = SOURCE; // plain source: loads everything
+    else packages.push(SOURCE);
+    return applyAndReport(packages, "installed: every extension in the package");
+  }
+  const picked = [];
+  for (const raw of names) {
+    const n = normalizeName(raw);
+    if (!n) { console.error(`error: unknown extension '${raw}'. Known: ${NAMES.join(", ")} (or 'all')`); process.exit(1); }
+    if (!picked.includes(n)) picked.push(n);
+  }
+  const entry = { source: SOURCE, extensions: picked.map(PATH_OF) };
+  if (idx >= 0) packages[idx] = entry; else packages.push(entry);
+  applyAndReport(packages, `installed: ${picked.join(", ")}`);
+}
+
+function cmdUninstall(names) {
+  const settings = readSettings();
+  if (!settings) { console.log(`nothing configured in ${SETTINGS} — nothing to uninstall.`); return; }
+  const packages = loadPackages(settings);
+  const idx = findEntryIndex(packages);
+  if (idx < 0) { console.log("package not configured — nothing to uninstall."); return; }
+  const entry = entryOf(packages[idx]);
+
+  if (names.length === 1 && names[0].toLowerCase() === "all") {
+    packages.splice(idx, 1);
+    return applyAndReport(packages, "uninstalled: package entry removed (cached git checkout left in place; delete it manually if you want it gone)");
+  }
+  const picked = [];
+  for (const raw of names) {
+    const n = normalizeName(raw);
+    if (!n) { console.error(`error: unknown extension '${raw}'. Known: ${NAMES.join(", ")} (or 'all')`); process.exit(1); }
+    if (!picked.includes(n)) picked.push(n);
+  }
+  const enabled = enabledSet(entry, NAMES);
+  for (const n of picked) enabled.delete(n);
+  let newEntry;
+  if (entry.extensions === undefined) {
+    // everything was loading: switch to an exclude filter for exactly the removed names
+    newEntry = { source: SOURCE, extensions: picked.map((n) => `-${PATH_OF(n)}`) };
+  } else {
+    newEntry = { source: SOURCE, extensions: NAMES.filter((n) => enabled.has(n)).map(PATH_OF) };
+  }
+  packages[idx] = newEntry;
+  applyAndReport(packages, `uninstalled: ${picked.join(", ")}`);
+}
+
+switch (cmd) {
+  case "list": showList(); break;
+  case "install": cmdInstall(nameArgs); break;
+  case "uninstall": case "remove": cmdUninstall(nameArgs); break;
+  case "help":
+    console.log("usage: pi-extensions [-l] [--agent-dir DIR] [list|install|uninstall] [names...]");
+    console.log("  list                    show extensions, what loads, and package freshness");
+    console.log("  install all             load every extension (drop the filter)");
+    console.log("  install <name...>       load exactly <name...> (allow-list)");
+    console.log("  uninstall <name...>     stop loading <name...>, keep the rest");
+    console.log("  uninstall all           remove the package entry entirely");
+    console.log("names:", NAMES.join(", "));
+    break;
+  default:
+    console.error(`error: unknown command '${cmd}'. Try: pi-extensions help`);
+    process.exit(1);
+}
+EOF
