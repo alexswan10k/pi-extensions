@@ -9,13 +9,34 @@ Lambdasafe's Pi extensions, version-controlled here and installed as an ordinary
 | `extensions/workspace-swarm.ts` | One loopback HTTP hub per workspace: group chat + agent inspector at `http://127.0.0.1:<port>`, tools `send_swarm_message` / `swarm_status` / `get_swarm_history`. Details in [SWARM.md](SWARM.md). |
 | `extensions/ringfence.ts` | Default-deny guardrail around `ctx.cwd`: blocks file/shell calls that escape the workspace, touch `$HOME`, or do machine-wide/destructive things, and tells the model to log the need to `user_request.txt`. Optionally has a model read every shell command first (see below). Not a security boundary. Escape hatch: `RINGFENCE=off`. |
 | `extensions/ask-jev.ts` | Tool `ask_jev`: cheap yes/no, pick-one and rate judgements from the local LM Studio **decision model**, one pass over many files/images. |
+| `extensions/self-propagate.ts` | Opt-in, agent-authored context self-compaction: when the context budget fills, the agent writes its own checkpoint summary and persistent key-value working memory (survives compaction) instead of losing the thread. Tools `self_compact` / `memory_store`, commands `/propagate` (on/off/status/budget/idle) and `/keep-awake` (scheduled wake ticks). Writes `.pi/memory/<session>.json` under the session cwd. |
 
-Zero runtime dependencies — both use only `node:*` plus the host-provided
-`@earendil-works/pi-coding-agent` types (declared in `peerDependencies`).
+Zero runtime dependencies — all four use only `node:*` plus the host-provided
+`@earendil-works/pi-coding-agent` types and `typebox` (declared in `peerDependencies`;
+self-propagate uses `Type` from `typebox`, everything else is plain objects).
 
 ## Install
 
 This repo is the source of truth; every project installs it from GitHub.
+
+There are two different things you might want, and they use different settings:
+
+| Want | How |
+|---|---|
+| **Everything** (all four extensions) | `pi install` — no filter in the entry |
+| **Just one extension** | same package, `"extensions"` filter listing only that path |
+
+The filter is an `"extensions"` array on the package entry in `settings.json`
+(`~/.pi/agent/settings.json` for global, `.pi/settings.json` for a project). An
+entry without the array loads everything the package discovers; an entry with the
+array loads only what it allows. Plain paths are allow-lists; a leading `-` excludes
+exactly one path; a leading `!` excludes a glob; `["+path"]` force-includes one exact
+path even if a glob excluded it. Filters narrow the package — they never load
+something the package itself does not declare. Let `pi config` write/toggle these for
+you if you would rather not edit JSON (Tab switches global/project scope), and
+`pi list -a` shows what actually resolved.
+
+### Everything, everywhere
 
 Global (every Pi session, all machines):
 
@@ -23,24 +44,47 @@ Global (every Pi session, all machines):
 pi install git:github.com/alexswan10k/pi-extensions
 ```
 
-That loads all three extensions everywhere. The fence is usually only wanted in chosen
-repos, so turn the plain entry in `~/.pi/agent/settings.json` into a filtered one:
+### Just one extension, everywhere
+
+Hand-write the global entry in `~/.pi/agent/settings.json` — an allow-list with a
+single path. Example: only self-propagate globally:
+
+```json
+{ "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["extensions/self-propagate.ts"] }
+```
+
+To list more than one, add more paths (`["extensions/ask-jev.ts", "extensions/self-propagate.ts"]`).
+To load nothing, use `[]`.
+
+### Everything except one, everywhere
+
+The fence is usually only wanted in chosen repos, so turn the plain global entry into an
+exclude filter:
 
 ```json
 { "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["-extensions/ringfence.ts"] }
 ```
 
-Per-project (a repo where the fence *is* wanted) — run from that project:
+### Everything, in one project only
+
+Run from that project (a project where the fence *is* wanted, say):
 
 ```bash
 pi install -l git:github.com/alexswan10k/pi-extensions
 ```
 
-A project entry **replaces** the personal entry, so the project loads whatever the
-package declares (all three) unless it filters. Switch what loads per scope with
-`pi config` (Tab = global/project) and `pi list -a` to see resolved sources. Git sources
-are identified by repo URL (ignoring the ref), so a global and a project entry never
-load twice.
+A project entry **replaces** the personal entry for that project, so it loads whatever
+the package declares (all four) unless it filters. To get just one (or all-except-one)
+in a project, run `pi config --local` and toggle, or hand-write `.pi/settings.json`
+with the same filtered entry shown above — the shape is identical, only the file moves:
+
+```json
+{ "packages": [ { "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["extensions/self-propagate.ts"] } ] }
+```
+
+Git sources are identified by repo URL (ignoring the ref), so a global and a project
+entry never load twice in one session. Changing what loads per scope: `pi config`
+(Tab = global/project).
 
 Don't keep a hand-copied `.pi/extensions/` in a project: it shadows this package, drifts,
 and loads a second copy of the swarm. Delete it and install the source instead.
