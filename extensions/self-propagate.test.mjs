@@ -373,6 +373,19 @@ assert.match(p1.systemPrompt, /pi's own context bar/i, "the two percentage bases
 assert.match(p1.systemPrompt, /wake_defer/, "deferral tool is documented in the protocol");
 assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or 5k\+ above the post-compact floor/, "protocol teaches the relative pressure gate");
 
+// ---- Phase 10c — legacy memory file (no floor field) still gates correctly ----
+{
+  const s14 = boot("s14b", { tokens: 28000 });
+  await s14.commands["self-propagate"].handler("on", s14.ctx);
+  const legacy = s14.readMemory();
+  delete legacy.cacheFloorTokens; // simulate a file written by pre-floor code
+  fs.writeFileSync(s14.memoryFile, JSON.stringify(legacy));
+  await s14.events.session_start({}, s14.ctx);
+  const d = await s14.tools.wake_defer.execute("m1", { minutes: 60 }, undefined, undefined, s14.ctx);
+  assert.equal(d.details.autoCompaction, true, "legacy file => bootstrap floor => 28k is over the gate (NaN-safe)");
+  assert.ok(s14.readMemory().cacheFloorTokens > 0, "the field is re-persisted on the next save");
+}
+
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
 const leftovers = fs.readdirSync(path.join(dir, ".pi", "memory")).filter((f) => f.includes(".tmp."));
 assert.deepEqual(leftovers, [], "no .tmp files left behind");

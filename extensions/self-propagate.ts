@@ -199,6 +199,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           overBudgetTurns: Math.max(0, Math.floor(Number(raw.overBudgetTurns) || 0)),
           idleCompactWarned: Boolean(raw.idleCompactWarned ?? false),
           wakeDeferredUntil: Math.max(0, Math.floor(Number(raw.wakeDeferredUntil) || 0)),
+          // Legacy files predate the floor field — without this the gate
+          // would compare against NaN and never fire.
+          cacheFloorTokens: Number(raw.cacheFloorTokens) || FLOOR_BOOTSTRAP_TOKENS,
         };
         return;
       } catch {
