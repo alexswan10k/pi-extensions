@@ -52,7 +52,27 @@ pi install git:github.com/alexswan10k/pi-extensions
 ### Just one extension, everywhere
 
 Hand-write the global entry in `~/.pi/agent/settings.json` — an allow-list with a
-single path. Example: only self-propagate globally:
+single path. Copy whichever one you want (it replaces the plain entry):
+
+Only `workspace-swarm`:
+
+```json
+{ "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["extensions/workspace-swarm.ts"] }
+```
+
+Only `ringfence`:
+
+```json
+{ "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["extensions/ringfence.ts"] }
+```
+
+Only `ask-jev`:
+
+```json
+{ "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["extensions/ask-jev.ts"] }
+```
+
+Only `self-propagate`:
 
 ```json
 { "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["extensions/self-propagate.ts"] }
@@ -60,6 +80,30 @@ single path. Example: only self-propagate globally:
 
 To list more than one, add more paths (`["extensions/ask-jev.ts", "extensions/self-propagate.ts"]`).
 To load nothing, use `[]`.
+
+### Just one extension, from a local clone
+
+For hacking on the extensions themselves: clone the repo and point the entry at the
+checkout — Pi loads the path in place (no copy), so edits apply after `/reload`.
+Drop the same single-path filter into `~/.pi/agent/settings.json` (global) or
+`.pi/settings.json` (project, paths resolve from `.pi/`):
+
+```bash
+git clone https://github.com/alexswan10k/pi-extensions ~/pi-extensions
+```
+
+```json
+{ "source": "~/pi-extensions", "extensions": ["extensions/self-propagate.ts"] }
+```
+
+or the unfiltered everything-from-disk install the CLI writes for you:
+
+```bash
+pi install ~/pi-extensions        # or: pi install -l ~/pi-extensions  (project)
+```
+
+(The `pi install <path>` form loads whatever you give it; the filtered form is the
+same thing with the `"extensions"` array added by hand.)
 
 ### Everything except one, everywhere
 
@@ -112,10 +156,7 @@ is sugar over the same format.
 Don't keep a hand-copied `.pi/extensions/` in a project: it shadows this package, drifts,
 and loads a second copy of the swarm. Delete it and install the source instead.
 
-Editing the extensions themselves? Clone and install the checkout —
-`pi install ./pi-extensions` loads the path without copying, so edits apply after
-`/reload` and restart of live sessions. A relative source resolves from the directory
-holding the settings file (`<project>/.pi` or `~/.pi/agent`), not the project root.
+Editing the extensions themselves? See [Just one extension, from a local clone](#just-one-extension-from-a-local-clone) — and note a relative source resolves from the directory holding the settings file (`<project>/.pi` or `~/.pi/agent`), not the project root.
 
 Updating an installed git source: `pi update --extensions` (a pinned `@ref` stays pinned).
 
