@@ -35,6 +35,13 @@ const RECLAIM_MARGIN_TOKENS = 5_000;
 // absolute keeps a 25k+ prefix shrinking (the user's number); the relative keeps
 // the gate from firing forever when the floor itself is 25k+ (a fat tool head).
 const PRESSURE_ABS_TOKENS = 25_000;
+// pi refuses compaction when the RAW history since the last compaction can't
+// cover its keepRecentTokens floor (default 20k estimated tokens, chars/4 —
+// NOT the usage-based prefix). A full-wipe checkpoint below this floor is a
+// guaranteed refusal, so the automatic shrink paths won't attempt it. If a
+// deployment lowers compaction.keepRecentTokens in pi settings, this constant
+// won't follow it; compaction just gets skipped a little longer than needed.
+const PI_MIN_COMPACTABLE_TOKENS = 20_000;
 const RETAIN_NONE_SENTINEL = "__self_propagate_retain_none__";
 
 // Static protocol text appended to every system prompt. MUST stay byte-identical
@@ -57,7 +64,8 @@ function renderProtocolBlock(ctx: ExtensionContext, persisted: PersistedSessionS
     `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
     `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
     `- When calling \`self_compact\`, all prior turns are wiped. Your \`summary\` must contain all active state, modified files, and next steps. If pi refuses the compaction (its error is reported to you), your history is retained — do not believe a checkpoint happened, and retry self_compact later if you still need it.\n` +
-    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 5k+ above the post-compact floor, if larger) — one planned bust, then it holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
+    `- Reported token usage includes the post-compact floor (system+tools+checkpoint) — that part is NOT yours to shed; only raw history is. pi refuses compaction outright while fewer than ~20k estimated tokens of raw history have accumulated since the last compaction, so do not call \`self_compact\` (or expect one to be auto-queued) below that floor.\n` +
+    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat, compactable prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 5k+ above the post-compact floor, if larger) and ~20k+ of raw history has accumulated since the last compaction — one planned bust, then it holds the full deferral (any duration; 0 clears); below pi's ~20k raw-history floor no shrink is possible, only the deferral; at the floor, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
   );
 }
 
@@ -296,6 +304,78 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   }
 
   // --- Context Budget Accounting ---
+  // Rough chars/4 estimate of one transcript entry's context-visible size,
+  // mirroring pi's estimateTokens (text/thinking/toolCall/user/toolResult).
+  // Invisible entries (compaction, context_edit, model_change, …) count 0.
+  function estimateEntryTokens(entry: any): number {
+    if (!entry || typeof entry !== "object") return 0;
+    const contentChars = (c: any): number => {
+      if (typeof c === "string") return c.length;
+      if (!Array.isArray(c)) return 0;
+      let chars = 0;
+      for (const b of c) {
+        if (typeof b?.text === "string") chars += b.text.length;
+        else if (b?.type === "image") chars += 4800;
+        else chars += JSON.stringify(b ?? null).length;
+      }
+      return chars;
+    };
+    if (entry.type !== "message" || !entry.message) return 0;
+    const m = entry.message;
+    switch (m.role) {
+      case "user":
+      case "toolResult":
+      case "custom":
+        return contentChars(m.content) / 4;
+      case "bashExecution":
+        return ((m.command?.length ?? 0) + (m.output?.length ?? 0)) / 4;
+      case "branchSummary":
+      case "compactionSummary":
+        return (m.summary?.length ?? 0) / 4;
+      case "assistant": {
+        let chars = 0;
+        for (const b of m.content ?? []) {
+          if (b?.type === "text") chars += b.text?.length ?? 0;
+          else if (b?.type === "thinking") chars += b.thinking?.length ?? 0;
+          else if (b?.type === "toolCall")
+            chars +=
+              (b.name?.length ?? 0) + JSON.stringify(b.arguments ?? {}).length;
+        }
+        return chars / 4;
+      }
+      default:
+        return 0;
+    }
+  }
+
+  // Estimated tokens of the raw tail AFTER the last compaction entry —
+  // exactly the basis pi measures its compaction floor on. Unmeasurable
+  // (no/branch unavailable) → Infinity: let pi make the call rather than
+  // block a possibly-valid shrink forever.
+  function estimateTailTokens(ctx: ExtensionContext): number {
+    const branch: any[] = ctx.sessionManager?.getBranch?.() ?? [];
+    if (!Array.isArray(branch) || branch.length === 0) return Number.POSITIVE_INFINITY;
+    let boundary = -1;
+    for (let i = branch.length - 1; i >= 0; i--) {
+      if (branch[i]?.type === "compaction") { boundary = i; break; }
+    }
+    let tokens = 0;
+    for (let i = boundary + 1; i < branch.length; i++) {
+      tokens += estimateEntryTokens(branch[i]);
+    }
+    return tokens;
+  }
+
+  // Will pi's prepareCompaction find anything to cut? A full-wipe checkpoint
+  // below the floor is a guaranteed "Nothing to compact (session too small)".
+  function compactionViable(ctx: ExtensionContext): boolean {
+    try {
+      return estimateTailTokens(ctx) >= PI_MIN_COMPACTABLE_TOKENS;
+    } catch {
+      return true;
+    }
+  }
+
   function getBudgetMetrics(ctx: ExtensionContext) {
     const usage = ctx.getContextUsage?.();
     const physicalWindow =
@@ -307,11 +387,15 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     const budgetPercent =
       budgetCeiling > 0 ? Math.round((tokens / budgetCeiling) * 100) : 0;
 
+    const floor = state.persisted.cacheFloorTokens;
+    const history = Math.max(0, tokens - floor);
     return {
       tokens,
       physicalWindow,
       budgetCeiling,
       budgetPercent,
+      floorTokens: floor,
+      historyTokens: history,
     };
   }
 
@@ -330,7 +414,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       ctx.ui?.setStatus?.("self-propagate", undefined);
       return;
     }
-    const { tokens, budgetCeiling, budgetPercent } = getBudgetMetrics(ctx);
+    const { tokens, budgetCeiling, budgetPercent, floorTokens, historyTokens } = getBudgetMetrics(ctx);
     const deferredMs = state.persisted.wakeDeferredUntil - Date.now();
     const wakeTag =
       deferredMs > 0
@@ -345,7 +429,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         : "";
     ctx.ui?.setStatus?.(
       "self-propagate",
-      `CTX: ${budgetPercent}% (${Math.round(tokens / 1000)}k/${Math.round(budgetCeiling / 1000)}k)${graceTag} | KV: ${kvCount}/${MAX_KV_ENTRIES}${wakeTag}`
+      `CTX: ${budgetPercent}% (${Math.round(tokens / 1000)}k/${Math.round(budgetCeiling / 1000)}k, ~${Math.round(historyTokens / 1000)}k history + ${Math.round(floorTokens / 1000)}k floor)${graceTag} | KV: ${kvCount}/${MAX_KV_ENTRIES}${wakeTag}`
     );
   }
 
@@ -638,13 +722,15 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         }
 
         const idleMs = Date.now() - state.lastActiveAt;
-        const { tokens, budgetPercent } = getBudgetMetrics(ctx);
-        const pressure = overReclaimGate(ctx);
+        const { tokens, budgetPercent, floorTokens, historyTokens } = getBudgetMetrics(ctx);
+        // Below pi's ~20k raw-tail floor a shrink can't run — don't send the
+        // agent chasing a compaction that will be refused.
+        const pressure = overReclaimGate(ctx) && compactionViable(ctx);
 
         // Two lean message shapes; the pressure one turns the (likely already
         // happened) eviction into a planned shrink: compact, then rest.
         const pressureMsg =
-          `<keep_awake_tick pressure="1" tokens_k="${Math.round(tokens / 1000)}" floor_k="${Math.round(state.persisted.cacheFloorTokens / 1000)}">\n` +
+          `<keep_awake_tick pressure="1" tokens_k="${Math.round(tokens / 1000)}" floor_k="${Math.round(floorTokens / 1000)}" history_k="${Math.round(historyTokens / 1000)}">\n` +
           `Prefix is above the post-compact floor — assume your KV cache is evicted. self_compact(continueAfter: false) now, then wake_defer if still waiting: sleeping on a small prefix is cheap.\n` +
           `</keep_awake_tick>`;
         const warmMsg =
@@ -803,7 +889,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "self_compact",
     label: "Self Compact Context",
     description:
-      "Wipe raw conversation history and replace it with your own structured summary, the session goal (the standing mandate, re-baked verbatim), and persistent KV working memory.",
+      "Wipe raw conversation history and replace it with your own structured summary, the session goal (the standing mandate, re-baked verbatim), and persistent KV working memory. Pi refuses to compact — the call fails, history retained — while fewer than ~20k estimated tokens of raw history have accumulated since the last compaction; do not call below that threshold (reported usage includes the ~fixed post-compact floor, which is NOT compactable).",
     parameters: {
       type: "object",
       properties: {
@@ -981,7 +1067,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     name: "wake_defer",
     label: "Defer Wake Ticks",
     description:
-      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: if the prefix is 25k+ tokens (or 5k+ above the post-compact floor, if larger), a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
+      `Silence self-propagate wake ticks for N minutes; 0 clears. Any duration is allowed — a long deferral is safe: once ~20k tokens of raw history have accumulated since the last compaction AND the prefix is 25k+ (or 5k+ above the post-compact floor, if larger), a shrink compaction is auto-queued FIRST (one planned cache bust at a known moment, then the session sleeps on a minimal prefix); below pi's ~20k raw-history floor the shrink is impossible and the deferral is set anyway; if it is already at the floor, no compaction. If you want to CONTINUE after shrinking, call self_compact (continueAfter: true) yourself before this tool. Persists across restarts; shown in footer/status.`,
     parameters: {
       type: "object",
       properties: {
@@ -1017,8 +1103,10 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       // prefix cannot enter a long sleep unshrunk. If the agent already queued its
       // own self_compact this turn (continueAfter: true path), its summary wins.
       const tokens = getBudgetMetrics(ctx).tokens;
+      const gateOver = overReclaimGate(ctx);
+      const canShrink = gateOver && compactionViable(ctx);
       let autoQueued = false;
-      if (mins > 0 && !state.persisted.pendingCompaction && overReclaimGate(ctx)) {
+      if (mins > 0 && !state.persisted.pendingCompaction && canShrink) {
         state.persisted.pendingCompaction = {
           summary:
             (typeof params.summary === "string" && params.summary.trim()) ||
@@ -1040,7 +1128,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
                 ? "Wake deferral cleared — ticks resume on the next idle interval."
                 : autoQueued
                   ? `Prefix ${Math.round(tokens / 1000)}k is above the post-compact floor, so a shrink compaction was queued before the sleep (one planned bust, then a minimal prefix). Deferral set for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Conclude your response now — no further tool calls.`
-                  : `Wake ticks deferred for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.${state.persisted.pendingCompaction ? " Your self_compact will run first; the deferral holds after." : " Prefix is at the floor — evictions are cheap, any duration is safe."}`,
+                  : `Wake ticks deferred for ${mins}m (until ${new Date(state.persisted.wakeDeferredUntil).toISOString()}). Pass 0 to clear early.${state.persisted.pendingCompaction ? " Your self_compact will run first; the deferral holds after." : gateOver ? ` Prefix is ${Math.round(tokens / 1000)}k but fewer than ~20k tokens of history have accumulated since the last compaction — pi refuses to compact below that floor, so no shrink was queued; the deferral is set regardless.` : " Prefix is at the floor — evictions are cheap, any duration is safe."}`,
           },
         ],
         details: {
@@ -1589,7 +1677,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
     if (!state.persisted.enabled) return;
 
-    const { tokens, budgetCeiling, budgetPercent } = getBudgetMetrics(ctx);
+    const { tokens, budgetCeiling, budgetPercent, floorTokens, historyTokens } = getBudgetMetrics(ctx);
 
     let budgetAlert: string | null = null;
     if (budgetPercent >= 100) {
@@ -1612,11 +1700,11 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       state.persisted.overBudgetTurns = 0;
       if (budgetPercent >= 75) {
         budgetAlert =
-          `[CONTEXT WARNING: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens). ` +
+          `[CONTEXT WARNING: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens, of which ~${Math.round(historyTokens / 1000)}k is conversation and ~${Math.round(floorTokens / 1000)}k is the fixed floor). ` +
           `Reach a clean checkpoint soon and call \`self_compact\` to free context.]`;
       } else if (budgetPercent >= 50) {
         budgetAlert =
-          `[CONTEXT NOTICE: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens) used.]`;
+          `[CONTEXT NOTICE: ${budgetPercent}% of budget (${tokens}/${budgetCeiling} tokens, of which ~${Math.round(historyTokens / 1000)}k is conversation and ~${Math.round(floorTokens / 1000)}k is the fixed floor) used.]`;
       }
     }
 

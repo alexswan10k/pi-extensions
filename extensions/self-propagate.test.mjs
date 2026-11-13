@@ -17,6 +17,13 @@ const BRANCH = [
 	{ id: "e2", type: "message", message: { role: "assistant", content: "on it" } },
 	{ id: "e3", type: "message", message: { role: "user", content: "also add a watchdog" } },
 ];
+// A raw tail pi would accept cutting: ~30k estimated tokens (chars/4) since
+// the last compaction — above pi's ~20k compaction floor.
+const BRANCH_BIG = Array.from({ length: 30 }, (_, i) =>
+	i % 2 === 0
+		? { id: `b${i}`, type: "message", message: { role: "user", content: "u".repeat(4000) } }
+		: { id: `b${i}`, type: "message", message: { role: "assistant", content: [{ type: "text", text: "a".repeat(4000) }] } }
+);
 
 function boot(sessionId, { tokens = 1000, branch = BRANCH, model, compactOk = true } = {}) {
 	const tools = {};
@@ -340,7 +347,7 @@ assert.equal(s11.readMemory().wakeDeferredUntil, 0, "cleared again for later pha
 // ============================================================================
 {
   // Big prefix: 28k tokens vs the 15k bootstrap floor => gate = 25k => over.
-  const s13 = boot("s13b", { tokens: 28000 });
+  const s13 = boot("s13b", { tokens: 28000, branch: BRANCH_BIG });
   await s13.commands["self-propagate"].handler("on", s13.ctx);
   await s13.commands["self-propagate"].handler("budget 0.5", s13.ctx); // headroom so 28k < ceiling
   await s13.tools.wake_defer.execute("g1", { minutes: 300, summary: "waiting for the CI run to finish" }, undefined, undefined, s13.ctx);
@@ -360,6 +367,19 @@ assert.equal(s11.readMemory().wakeDeferredUntil, 0, "cleared again for later pha
   assert.equal(d.details.autoCompaction, undefined, "no second compaction overwrites the first");
 }
 
+// ---- Phase 10d — over the prefix gate but a thin raw tail (right after a
+// compaction): pi would refuse, so no shrink is queued, ever ---------------
+{
+  const s15 = boot("s15b", { tokens: 28000 }); // default tiny BRANCH: ~30 tokens of raw history
+  await s15.commands["self-propagate"].handler("on", s15.ctx);
+  await s15.commands["self-propagate"].handler("budget 0.5", s15.ctx);
+  const d = await s15.tools.wake_defer.execute("n1", { minutes: 90, summary: "waiting" }, undefined, undefined, s15.ctx);
+  assert.notEqual(d.details.autoCompaction, true, "below pi's ~20k raw-tail floor => no auto-compaction");
+  assert.equal(s15.readMemory().pendingCompaction, null, "nothing queued below the floor");
+  assert.match(d.content[0].text, /~20k/, "the deferral message explains pi's floor");
+  assert.ok(s15.readMemory().wakeDeferredUntil > Date.now() + 89 * 60_000, "the deferral itself is still honored");
+}
+
 // ---- Phase 11: the protocol head states the numeric ceiling, byte-stably --------
 const s12 = boot("sess-ceiling", { model: { contextWindow: 200000 } });
 await s12.events.session_start({}, s12.ctx);
@@ -375,7 +395,7 @@ assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or
 
 // ---- Phase 10c — legacy memory file (no floor field) still gates correctly ----
 {
-  const s14 = boot("s14b", { tokens: 28000 });
+  const s14 = boot("s14b", { tokens: 28000, branch: BRANCH_BIG });
   await s14.commands["self-propagate"].handler("on", s14.ctx);
   const legacy = s14.readMemory();
   delete legacy.cacheFloorTokens; // simulate a file written by pre-floor code
