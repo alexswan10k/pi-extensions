@@ -17,35 +17,97 @@ self-propagate uses `Type` from `typebox`, everything else is plain objects).
 
 ## Install
 
-This repo is the source of truth; every project installs it from GitHub. Use the
-bundled `bin/pi-extensions` script (bash + node, no dependencies) — it edits
-Pi's `settings.json` for you, with a timestamped backup each time:
+This repo is the source of truth; every project installs it from GitHub. The
+official path is `pi install`:
 
 ```bash
-bin/pi-extensions                      # list everything: per-extension descriptions,
-                                       # what loads globally, and whether the installed
-                                       # checkout is up to date with main
-bin/pi-extensions install all          # everything, everywhere
-bin/pi-extensions install self-propagate
-bin/pi-extensions install ask-jev ringfence     # a subset
-bin/pi-extensions uninstall ringfence  # everything, minus ringfence
-bin/pi-extensions uninstall all        # remove the package entirely
-bin/pi-extensions -l install all       # same, but project-scoped (.pi/settings.json)
-bin/pi-extensions -h                   # full usage
+pi install git:github.com/alexswan10k/pi-extensions
 ```
 
-Names are extension basenames (`workspace-swarm`, `ringfence`, `ask-jev`,
-`self-propagate`); `extensions/x.ts` is accepted too. Restart pi or `/reload` live
-sessions afterwards.
+There are two different things you might want, and they use different settings:
 
-Prefer raw JSON instead? It is ordinary Pi package config in `~/.pi/agent/settings.json`
-(global) or `.pi/settings.json` (project): a plain `"source"` entry loads everything;
-`"extensions": ["extensions/self-propagate.ts"]` loads an allow-list;
-`"extensions": ["-extensions/ringfence.ts"]` excludes one path; `[]` loads none.
-A project entry replaces the personal entry; `pi config` toggles resources per scope
-(Tab = global/project), `pi list -a` shows what resolved, `pi update --extensions`
-updates the checkout. Git sources are identified by repo URL (ignoring the ref), so
-a global and a project entry never load twice.
+| Want | How |
+|---|---|
+| **Everything** (all four extensions) | `pi install` — no filter in the entry |
+| **Just one extension** | same package, `"extensions"` filter listing only that path |
+
+The filter is an `"extensions"` array on the package entry in `settings.json`
+(`~/.pi/agent/settings.json` for global, `.pi/settings.json` for a project). An
+entry without the array loads everything the package discovers; an entry with the
+array loads only what it allows. Plain paths are allow-lists; a leading `-` excludes
+exactly one path; a leading `!` excludes a glob; `["+path"]` force-includes one exact
+path even if a glob excluded it. Filters narrow the package — they never load
+something the package itself does not declare. Let `pi config` write/toggle these for
+you if you would rather not edit JSON (Tab switches global/project scope), and
+`pi list -a` shows what actually resolved.
+
+### Everything, everywhere
+
+Global (every Pi session, all machines):
+
+```bash
+pi install git:github.com/alexswan10k/pi-extensions
+```
+
+### Just one extension, everywhere
+
+Hand-write the global entry in `~/.pi/agent/settings.json` — an allow-list with a
+single path. Example: only self-propagate globally:
+
+```json
+{ "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["extensions/self-propagate.ts"] }
+```
+
+To list more than one, add more paths (`["extensions/ask-jev.ts", "extensions/self-propagate.ts"]`).
+To load nothing, use `[]`.
+
+### Everything except one, everywhere
+
+The fence is usually only wanted in chosen repos, so turn the plain global entry into an
+exclude filter:
+
+```json
+{ "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["-extensions/ringfence.ts"] }
+```
+
+### Everything, in one project only
+
+Run from that project (a project where the fence *is* wanted, say):
+
+```bash
+pi install -l git:github.com/alexswan10k/pi-extensions
+```
+
+A project entry **replaces** the personal entry for that project, so it loads whatever
+the package declares (all four) unless it filters. To get just one (or all-except-one)
+in a project, run `pi config --local` and toggle, or hand-write `.pi/settings.json`
+with the same filtered entry shown above — the shape is identical, only the file moves:
+
+```json
+{ "packages": [ { "source": "git:github.com/alexswan10k/pi-extensions", "extensions": ["extensions/self-propagate.ts"] } ] }
+```
+
+Git sources are identified by repo URL (ignoring the ref), so a global and a project
+entry never load twice in one session. Changing what loads per scope: `pi config`
+(Tab = global/project).
+
+### Convenience: `bin/pi-extensions`
+
+If you would rather not hand-edit JSON, the bundled `bin/pi-extensions` script (bash +
+node, no dependencies) performs exactly the settings surgery above, with a timestamped
+backup of `settings.json` each time and a `git ls-remote` freshness check:
+
+```bash
+bin/pi-extensions                  # list extensions, what loads, and package freshness
+bin/pi-extensions install all      # drop the filter (equivalent to plain pi install)
+bin/pi-extensions install self-propagate
+bin/pi-extensions uninstall ringfence
+bin/pi-extensions -l install all   # project-scoped (.pi/settings.json)
+```
+
+It only ever edits the `pi-extensions` entry in the settings file; everything else in
+your settings is left untouched. `pi install` remains the source of truth — the script
+is sugar over the same format.
 
 Don't keep a hand-copied `.pi/extensions/` in a project: it shadows this package, drifts,
 and loads a second copy of the swarm. Delete it and install the source instead.
