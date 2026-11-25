@@ -31,6 +31,37 @@ There are two different things you might want, and they use different settings:
 | **Everything** (all four extensions) | `pi install` — no filter in the entry |
 | **Just one extension** | same package, `"extensions"` filter listing only that path |
 
+#### Quick: just one extension, straight from GitHub
+
+Install the package from the public repo, then narrow the resulting entry to a
+single path. Swap `ringfence` for the one you want (`workspace-swarm`,
+`ringfence`, `ask-jev`, `self-propagate`):
+
+```bash
+pi install git:github.com/alexswan10k/pi-extensions
+```
+
+```json
+{
+  "packages": [
+    {
+      "source": "git:github.com/alexswan10k/pi-extensions",
+      "extensions": ["extensions/ringfence.ts"]
+    }
+  ]
+}
+```
+
+Edit `~/.pi/agent/settings.json` (global) or `<project>/.pi/settings.json`
+(project); `pi install` wrote the entry as a plain string, so replace it with
+the filtered object above. No clone needed. Restart Pi or `/reload`, then
+`pi list -a` to confirm only that extension resolved.
+
+Or skip the JSON entirely: run `pi config`, select the package, and toggle off
+every extension except the one you want (Tab switches global/project scope).
+
+Don't append the file path to the git URL — `pi install git:github.com/alexswan10k/pi-extensions/extensions/ringfence.ts` fails with `repository not found`, because Pi treats the whole string as the repo to clone. Git sources are repo-level; select the file with the filter above.
+
 The filter is an `"extensions"` array on the package entry in `settings.json`
 (`~/.pi/agent/settings.json` for global, `.pi/settings.json` for a project). An
 entry without the array loads everything the package discovers; an entry with the
