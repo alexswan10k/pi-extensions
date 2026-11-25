@@ -1299,6 +1299,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     { value: "on", description: "Re-enable compaction after /off (goal and wake stay off)" },
     { value: "on here", description: "Re-enable and opt into a goal seeded from your latest user message" },
     { value: "off", description: "Disable compaction; clears goal opt-in, wake timers, pending compaction" },
+    { value: "reset", description: "Reset budget/grace/wake config to defaults; keeps goal, KV and checkpoint" },
     { value: "status", description: "Full state: budget bar, goal, anchor, KV store, timers" },
     { value: "budget", description: "Set/show budget ceiling as fraction of model window (0.3–0.95, default 0.65)" },
     { value: "wake", description: "Idle nudge: `once <minutes>` (default 45m: self-compact once per idle streak) or `every <minutes>` (opt-in repeating cron) | `off` (clears deferral)" },
@@ -1377,6 +1378,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       "  on here            Also opt into a goal seeded from your latest user message",
       "                     (the seed floor is 1 turn).",
       "  off                Disable; clears goal opt-in, wake timers, pending compaction.",
+      "  reset              Restore default config (65% ceiling, 2 grace turns, 45m idle",
+      "                     nudge, no repeating cron). Keeps goal, KV and checkpoint state.",
       "  status             Full state: budget bar, goal, anchor, KV, timers.",
       "  budget <0.3-0.95>  Effective ceiling as fraction of model window (default 0.65).",
       "                     No argument prints the current value.",
@@ -1417,7 +1420,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("self-propagate", {
     description:
-      "Self-propagation (compaction on by default; goal/wake opt-in): /self-propagate help | on [here] | off | status | budget <0.3-0.95> | wake <once|every> <minutes> | wake off | goal <show|set|clear|reset|here|draft> | compact",
+      "Self-propagation (compaction on by default; goal/wake opt-in): /self-propagate help | on [here] | off | reset | status | budget <0.3-0.95> | wake <once|every> <minutes> | wake off | goal <show|set|clear|reset|here|draft> | compact",
     getArgumentCompletions: (prefix: string) => {
       const lower = prefix.toLowerCase();
       const firstSpace = lower.indexOf(" ");
@@ -1554,6 +1557,27 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         ensureGlobalWatchdog();
         updateFooterStatus(ctx);
         ctx.ui.notify("Self-propagation DISABLED for this session. /self-propagate on to re-enable.", "info");
+        return;
+      }
+
+      if (sub === "reset") {
+        state.persisted.enabled = true;
+        state.persisted.budgetRatio = DEFAULT_BUDGET_RATIO;
+        state.persisted.graceTurns = DEFAULT_GRACE_TURNS;
+        state.persisted.keepAwakeMinutes = 0;
+        state.persisted.idleCompactMinutes = DEFAULT_IDLE_COMPACT_MINUTES;
+        state.persisted.overBudgetTurns = 0;
+        state.persisted.idleCompactWarned = false;
+        state.persisted.wakeDeferredUntil = 0;
+        state.lastActiveAt = Date.now();
+        saveState(ctx);
+        syncToolVisibility();
+        ensureGlobalWatchdog();
+        updateFooterStatus(ctx);
+        ctx.ui.notify(
+          `Config reset to defaults: ${Math.round(DEFAULT_BUDGET_RATIO * 100)}% ceiling, ${DEFAULT_GRACE_TURNS} grace turns, ${DEFAULT_IDLE_COMPACT_MINUTES}m idle nudge, repeating cron off. Goal, KV notes and checkpoint state kept.`,
+          "info"
+        );
         return;
       }
 

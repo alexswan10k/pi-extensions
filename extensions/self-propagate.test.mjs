@@ -472,6 +472,29 @@ assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or
   assert.equal(s.activeTools.includes("goal_set"), false, "goal_set hides again after the clear");
 }
 
+// ---- Phase 15: /reset upgrades legacy config without losing durable state ----
+{
+  const file = path.join(dir, ".pi", "memory", "sess-reset.json");
+  fs.writeFileSync(file, JSON.stringify({
+    enabled: false,
+    budgetRatio: 0.85,
+    pinnedContext: { text: "KEEP THE GOAL", source: "user", updatedAt: "2026-01-01" },
+    kv: { keep: { key: "keep", title: "Keep", body: "KEEP THE NOTE", updatedAt: "2026-01-01" } },
+  }));
+  const s = boot("sess-reset");
+  await s.events.session_start({}, s.ctx);
+  await s.commands["self-propagate"].handler("reset", s.ctx);
+  const m = s.readMemory();
+  assert.equal(m.enabled, true, "reset re-enables");
+  assert.equal(m.budgetRatio, 0.65, "reset applies the aggressive ceiling");
+  assert.equal(m.graceTurns, 2, "reset applies the 2-turn grace");
+  assert.equal(m.idleCompactMinutes, 45, "reset applies the 45m idle nudge");
+  assert.equal(m.keepAwakeMinutes, 0, "no repeating cron after reset");
+  assert.equal(m.pinnedContext.text, "KEEP THE GOAL", "goal preserved");
+  assert.equal(m.kv.keep.body, "KEEP THE NOTE", "KV preserved");
+  assert.match(notified(s), /kept/i, "reset reports what it preserves");
+}
+
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
 const leftovers = fs.readdirSync(path.join(dir, ".pi", "memory")).filter((f) => f.includes(".tmp."));
 assert.deepEqual(leftovers, [], "no .tmp files left behind");
