@@ -12,7 +12,15 @@ const MAX_TOTAL_KV_CHARS = 16000;
 const MAX_PINNED_TURNS = 4;
 const MAX_ORIGIN_TURN_CHARS = 12000;
 const MAX_PIN_CHARS = 12000;
-const GRACE_TURNS_AT_100 = 5;
+const DEFAULT_GRACE_TURNS = 2;
+const LEGACY_GRACE_TURNS = 5; // sessions that opted in under the old default keep their longer grace
+// Default-on compaction: the ceiling is a fraction of the physical window, so
+// a 200k model gives a 130k effective budget (notice 65k / warning 97.5k /
+// critical 130k). Goal stays opt-in; the only default wake is one idle nudge
+// after 45m, never the repeating keep-awake cron.
+const DEFAULT_BUDGET_RATIO = 0.65;
+const DEFAULT_IDLE_COMPACT_MINUTES = 45;
+const LEGACY_IDLE_COMPACT_MINUTES = 15;
 // Local-model cache reality: there is NO TTL — other local sessions evict this
 // session's KV cache via memory pressure, typically within 10-15m of silence, and
 // a bust costs a re-read of the WHOLE prefix. The rule is therefore: never let a
@@ -54,9 +62,11 @@ function renderProtocolBlock(ctx: ExtensionContext, persisted: PersistedSessionS
     `\n\n## Self-Propagation & Context Protocol\n` +
     `- Effective context budget: ${Math.round(ceiling / 1000)}k tokens (${Math.round(persisted.budgetRatio * 100)}% of the ${Math.round(window / 1000)}k-token model window). [Context: ...] tool tags, the footer and <self_propagate_budget> alerts are percentages of THIS ceiling; pi's own context bar is a percentage of the full window — never mix the two.\n` +
     `- Persistent Working Memory: use \`memory_store\` or \`self_compact.memoryUpserts\` for durable facts that survive compaction (current count: see /self-propagate status).\n` +
-    `- Session goal: the standing mandate, re-baked into every self-propagate checkpoint. If the session's goal has genuinely changed, propose a new one via \`goal_set\` — the user must approve it.\n` +
-    `- When calling \`self_compact\`, your window is cut down to your checkpoint: your \`summary\` plus the session goal and working memory ride the head of every future request. Your \`summary\` must contain all active state, modified files, and next steps. The transcript file is untouched — earlier turns stay visible to the user; only your window shrinks.\n` +
-    `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 5k+ above the post-compact floor, if larger) — one planned bust, then it holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.`
+    `- Session goal: if one is set, it is re-baked into every self-propagate checkpoint. Manage it with \`/self-propagate goal\` (opt-in; off by default).\n` +
+    `- When calling \`self_compact\`, your window is cut down to your checkpoint: your \`summary\` plus, if set, the session goal and working memory ride the head of every future request. Your \`summary\` must contain all active state, modified files, and next steps. The transcript file is untouched — earlier turns stay visible to the user; only your window shrinks.\n` +
+    (persisted.keepAwakeMinutes > 0 || persisted.idleCompactMinutes > 0
+      ? `- Local cache has no TTL — other local sessions evict it within ~10-15m of silence and a bust re-reads the whole prefix. So never sleep on a fat prefix: \`wake_defer\` auto-compacts first when the prefix is 25k+ (or 5k+ above the post-compact floor, if larger) — one planned bust, then it holds the full deferral (any duration; 0 clears); below that, deferral is cheap. If you want to CONTINUE after shrinking, call \`self_compact\` (continueAfter: true) before \`wake_defer\`.\n`
+      : "")
   );
 }
 
@@ -75,12 +85,13 @@ interface PinnedContext {
 
 interface PersistedSessionState {
   enabled: boolean;
-  budgetRatio: number; // Fraction of physical model contextWindow treated as 100% budget (default 0.85)
-  keepAwakeMinutes: number; // 0 = disabled
-  idleCompactMinutes: number; // Default 15m when keepAwakeMinutes === 0
+  budgetRatio: number; // Fraction of physical model contextWindow treated as 100% budget (default 0.65)
+  keepAwakeMinutes: number; // 0 = disabled (default)
+  idleCompactMinutes: number; // 45 = one self-compact nudge after 45m idle (default); 0 = off
   minPinnedTurns: number; // Seed floor for the initial goal (default 1) — applies until pinnedContext is set
   anchorEntryId: string | null; // null = session root; set via `/self-propagate on here`
-  pinnedContext: PinnedContext | null; // null = not yet seeded; set on enable or lazily at first checkpoint
+  goalSeedRequested: boolean; // true only after an explicit goal opt-in; gates lazy seeding
+  pinnedContext: PinnedContext | null; // null = no goal; seeded only when goalSeedRequested
   kv: Record<string, MemoryEntry>;
   // Durable across restarts so a restart cannot escape the grace lock or lose a
   // queued checkpoint. Ephemeral execution flags (isBusy/isCompacting) are NOT here.
@@ -90,6 +101,7 @@ interface PersistedSessionState {
   idleCompactWarned: boolean;
   wakeDeferredUntil: number; // epoch ms; 0 = not deferred
   cacheFloorTokens: number; // measured post-compact prefix size (system+tools+checkpoint)
+  graceTurns: number; // 2 by default; 5 for legacy files that explicitly opted in
 }
 
 interface PendingCompaction {
@@ -127,12 +139,13 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   const state: RuntimeState = {
     sessionId: "default",
     persisted: {
-      enabled: false,
-      budgetRatio: 0.85,
+      enabled: true,
+      budgetRatio: DEFAULT_BUDGET_RATIO,
       keepAwakeMinutes: 0,
-      idleCompactMinutes: 15,
+      idleCompactMinutes: DEFAULT_IDLE_COMPACT_MINUTES,
       minPinnedTurns: 1,
       anchorEntryId: null,
+      goalSeedRequested: false,
       pinnedContext: null,
       kv: {},
       pendingCompaction: null,
@@ -141,6 +154,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       idleCompactWarned: false,
       wakeDeferredUntil: 0,
       cacheFloorTokens: FLOOR_BOOTSTRAP_TOKENS,
+      graceTurns: DEFAULT_GRACE_TURNS,
     },
     isBusy: false,
     isCompacting: false,
@@ -166,6 +180,11 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       fs.mkdirSync(dir, { recursive: true });
     }
     return path.join(dir, `${sid.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+  }
+
+  function safeNum(value: unknown, fallback: number, min: number, max: number): number {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : fallback;
   }
 
   function loadState(ctx: ExtensionContext): void {
@@ -214,14 +233,21 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
                   typeof rawPin.updatedAt === "string" ? rawPin.updatedAt : new Date().toISOString(),
               }
             : null;
+        const legacy = typeof raw.graceTurns !== "number";
         state.persisted = {
-          enabled: Boolean(raw.enabled ?? false),
-          budgetRatio: Number(raw.budgetRatio ?? 0.85),
-          keepAwakeMinutes: Number(raw.keepAwakeMinutes ?? 0),
-          idleCompactMinutes: Number(raw.idleCompactMinutes ?? 15),
+          enabled: Boolean(raw.enabled ?? true),
+          budgetRatio: safeNum(raw.budgetRatio, DEFAULT_BUDGET_RATIO, 0.3, 0.95),
+          keepAwakeMinutes: safeNum(raw.keepAwakeMinutes, 0, 0, 1440),
+          idleCompactMinutes: safeNum(
+            raw.idleCompactMinutes ?? (legacy ? LEGACY_IDLE_COMPACT_MINUTES : undefined),
+            DEFAULT_IDLE_COMPACT_MINUTES,
+            0,
+            1440
+          ),
           minPinnedTurns: Math.max(1, Number(raw.minPinnedTurns ?? 1) || 1),
           anchorEntryId:
             typeof raw.anchorEntryId === "string" && raw.anchorEntryId ? raw.anchorEntryId : null,
+          goalSeedRequested: Boolean(raw.goalSeedRequested ?? false),
           pinnedContext,
           kv: raw.kv && typeof raw.kv === "object" ? raw.kv : {},
           pendingCompaction,
@@ -229,9 +255,10 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           overBudgetTurns: Math.max(0, Math.floor(Number(raw.overBudgetTurns) || 0)),
           idleCompactWarned: Boolean(raw.idleCompactWarned ?? false),
           wakeDeferredUntil: Math.max(0, Math.floor(Number(raw.wakeDeferredUntil) || 0)),
-          // Legacy files predate the floor field — without this the gate
-          // would compare against NaN and never fire.
-          cacheFloorTokens: Number(raw.cacheFloorTokens) || FLOOR_BOOTSTRAP_TOKENS,
+          cacheFloorTokens: safeNum(raw.cacheFloorTokens, FLOOR_BOOTSTRAP_TOKENS, 0, 1_000_000),
+          graceTurns: legacy
+            ? LEGACY_GRACE_TURNS
+            : safeNum(raw.graceTurns, DEFAULT_GRACE_TURNS, 1, 99),
         };
         return;
       } catch {
@@ -239,12 +266,13 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       }
     }
     state.persisted = {
-      enabled: false,
-      budgetRatio: 0.85,
+      enabled: true,
+      budgetRatio: DEFAULT_BUDGET_RATIO,
       keepAwakeMinutes: 0,
-      idleCompactMinutes: 15,
+      idleCompactMinutes: DEFAULT_IDLE_COMPACT_MINUTES,
       minPinnedTurns: 1,
       anchorEntryId: null,
+      goalSeedRequested: false,
       pinnedContext: null,
       kv: {},
       pendingCompaction: null,
@@ -252,6 +280,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       overBudgetTurns: 0,
       idleCompactWarned: false,
       wakeDeferredUntil: 0,
+      cacheFloorTokens: FLOOR_BOOTSTRAP_TOKENS,
+      graceTurns: DEFAULT_GRACE_TURNS,
     };
   }
 
@@ -263,12 +293,28 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   }
 
   // --- Tool Activation Gate ---
+  // Compaction is on by default; goal and wake tools appear only once their
+  // owner has explicitly configured them.
+  function goalActive(): boolean {
+    return state.persisted.pinnedContext !== null || state.persisted.goalSeedRequested;
+  }
+
+  function wakeActive(): boolean {
+    return state.persisted.keepAwakeMinutes > 0 || state.persisted.idleCompactMinutes > 0;
+  }
+
   function syncToolVisibility(): void {
     const currentActive = new Set(pi.getActiveTools());
+    const wanted = new Set<string>();
     if (state.persisted.enabled) {
-      for (const t of EXTENSION_TOOLS) currentActive.add(t);
-    } else {
-      for (const t of EXTENSION_TOOLS) currentActive.delete(t);
+      wanted.add("self_compact");
+      wanted.add("memory_store");
+      if (goalActive()) wanted.add("goal_set");
+      if (wakeActive()) wanted.add("wake_defer");
+    }
+    for (const t of EXTENSION_TOOLS) {
+      if (wanted.has(t)) currentActive.add(t);
+      else currentActive.delete(t);
     }
     pi.setActiveTools(Array.from(currentActive));
   }
@@ -452,7 +498,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     const kvCount = Object.keys(state.persisted.kv).length;
     const graceTag =
       state.persisted.overBudgetTurns > 0
-        ? ` [GRACE ${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100}]`
+        ? ` [GRACE ${state.persisted.overBudgetTurns}/${state.persisted.graceTurns}]`
         : "";
     ctx.ui?.setStatus?.(
       "self-propagate",
@@ -460,11 +506,10 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     );
   }
 
-  // --- Goal Setup on Enable ---
-  // Enabling seeds the goal explicitly from the branch (turn 1, or the `on here`
-  // anchor) and, in interactive mode, lets the user keep / edit / skip it. In
-  // headless mode the seed is kept silently. Choosing "skip" stores an empty
-  // user pin — a deliberate "no goal" that lazy seeding must never resurrect.
+  // --- Goal Setup (explicit opt-in only) ---
+  // `/self-propagate on here` seeds the goal from the branch and, interactively,
+  // lets the user keep / edit / skip it. In headless mode the seed is kept
+  // silently. "skip" leaves no goal at all; nothing re-seeds it later.
   const truncateMid = (s: string, n: number) => (s.length > n ? `${s.slice(0, n)}…` : s);
 
   async function setupGoalOnEnable(
@@ -473,18 +518,21 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   ): Promise<{ pin: PinnedContext | null; note: string }> {
     if (state.persisted.pinnedContext) {
       const p = state.persisted.pinnedContext;
+      state.persisted.goalSeedRequested = false;
       const desc = p.text.trim() ? `kept (${p.source}, ${p.text.length} chars)` : "cleared";
       return { pin: p, note: `Goal ${desc}.` };
     }
     const seed = extractPinSeed(ctx, state.persisted.minPinnedTurns ?? 1);
     if (!seed.text.trim()) {
-      return { pin: null, note: "" }; // branch is empty; nothing to seed from
+      // Empty branch: the explicit opt-in stays pending until a later checkpoint.
+      return { pin: null, note: "" };
     }
     state.persisted.pinnedContext = {
       text: scrubContextTags(seed.text),
       source: "seed",
       updatedAt: new Date().toISOString(),
     };
+    state.persisted.goalSeedRequested = false;
 
     const seedLabel = option === "here" ? "this turn" : "turn 1";
     const preview = truncateMid(seed.text.trim(), 400);
@@ -504,15 +552,18 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
             source: "user",
             updatedAt: new Date().toISOString(),
           };
+          state.persisted.goalSeedRequested = false;
           return { pin: state.persisted.pinnedContext, note: "Goal set to your edited text." };
         }
+        state.persisted.goalSeedRequested = false;
         return { pin: state.persisted.pinnedContext, note: "Goal kept (empty edit ignored)." };
       }
       if (choice === "skip") {
-        state.persisted.pinnedContext = { text: "", source: "user", updatedAt: new Date().toISOString() };
+        state.persisted.pinnedContext = null;
+        state.persisted.goalSeedRequested = false;
         return {
-          pin: state.persisted.pinnedContext,
-          note: "No goal pinned — re-injected checkpoint will omit it. Set one any time with /self-propagate goal set.",
+          pin: null,
+          note: "No goal pinned — checkpoints will omit it. Set one any time with /self-propagate goal set.",
         };
       }
       // "keep", or no UI / headless → keep the seed
@@ -612,8 +663,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     return { text: text.slice(0, MAX_PIN_CHARS), fellBack: true };
   }
 
-  function ensurePinnedContext(ctx: ExtensionContext, keepFirstTurns = 1): PinnedContext {
+  function ensurePinnedContext(ctx: ExtensionContext, keepFirstTurns = 1): PinnedContext | null {
     if (state.persisted.pinnedContext) return state.persisted.pinnedContext;
+    if (!state.persisted.goalSeedRequested) return null;
     const seed = extractPinSeed(ctx, keepFirstTurns);
     if (seed.fellBack) {
       ctx.ui?.notify?.(
@@ -627,12 +679,15 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       updatedAt: new Date().toISOString(),
     };
     state.persisted.pinnedContext = pinnedContext;
+    state.persisted.goalSeedRequested = false;
     saveState(ctx);
+    syncToolVisibility();
     return pinnedContext;
   }
 
   function renderPinnedContextBlock(ctx: ExtensionContext, keepFirstTurns: number): string {
     const pin = ensurePinnedContext(ctx, keepFirstTurns);
+    if (!pin) return "";
     if (!pin.text.trim()) {
       return `<pinned_context status="empty" source="${pin.source}" />\n\n`;
     }
@@ -784,10 +839,17 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     }
   }
 
-  // --- Background Watchdog (Keep-Awake & Idle Compaction) ---
+  // --- Background Watchdog (idle nudge + opt-in Keep-Awake) ---
+  // Default: one self-compact nudge after 45m idle when the prefix is worth
+  // reclaiming. The repeating keep-awake cron is opt-in, so Orca bots keep
+  // their own wake events in charge of ordinary idle activity.
   function ensureGlobalWatchdog(): void {
     const g = globalThis as any;
-    if (g[GLOBAL_TIMER_KEY]) clearInterval(g[GLOBAL_TIMER_KEY]);
+    if (g[GLOBAL_TIMER_KEY]) {
+      clearInterval(g[GLOBAL_TIMER_KEY]);
+      delete g[GLOBAL_TIMER_KEY];
+    }
+    if (!state.persisted.enabled || !wakeActive()) return;
 
     g[GLOBAL_TIMER_KEY] = setInterval(() => {
       try {
@@ -795,6 +857,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         if (
           !ctx ||
           !state.persisted.enabled ||
+          !wakeActive() ||
           state.isBusy ||
           state.isCompacting ||
           state.persisted.pendingCompaction
@@ -853,8 +916,6 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       }
     }, 15_000);
   }
-
-  ensureGlobalWatchdog();
 
   // --- Register Tools ---
   // Tool parameters are plain JSON Schema (what TypeBox emits) so this file also
@@ -1135,13 +1196,22 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         };
       }
 
-      setPinnedContext(text, "agent");
+      if (text) {
+        setPinnedContext(text, "agent");
+        state.persisted.goalSeedRequested = false;
+      } else {
+        state.persisted.pinnedContext = null;
+        state.persisted.goalSeedRequested = false;
+      }
       saveState(ctx);
+      syncToolVisibility();
       return {
         content: [
           {
             type: "text",
-            text: "Pinned context rewritten (user-approved). It takes effect at the next compaction — call self_compact, or the user can run /self-propagate compact, to apply it now.",
+            text: text
+              ? "Pinned context rewritten (user-approved). It takes effect at the next compaction — call self_compact, or the user can run /self-propagate compact, to apply it now."
+              : "Goal cleared (user-approved). No mandate will be re-injected after compaction.",
           },
         ],
         details: { applied: true },
@@ -1226,12 +1296,12 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
   // --- Commands: /self-propagate ---
   const PROPAGATE_SUBS = [
-    { value: "on", description: "Enable self-propagation for this session" },
-    { value: "on here", description: "Enable, anchoring the goal seed to your latest user message" },
-    { value: "off", description: "Disable; clears both wake timers and any queued compaction" },
+    { value: "on", description: "Re-enable compaction after /off (goal and wake stay off)" },
+    { value: "on here", description: "Re-enable and opt into a goal seeded from your latest user message" },
+    { value: "off", description: "Disable compaction; clears goal opt-in, wake timers, pending compaction" },
     { value: "status", description: "Full state: budget bar, goal, anchor, KV store, timers" },
-    { value: "budget", description: "Set/show budget ceiling as fraction of model window (0.3–0.95, default 0.85)" },
-    { value: "wake", description: "Wake the idle agent: `once <minutes>` (compact & pause when idle ≥25% budget) or `every <minutes>` (keep working; auto-enables) | `off` (also clears any wake_defer)" },
+    { value: "budget", description: "Set/show budget ceiling as fraction of model window (0.3–0.95, default 0.65)" },
+    { value: "wake", description: "Idle nudge: `once <minutes>` (default 45m: self-compact once per idle streak) or `every <minutes>` (opt-in repeating cron) | `off` (clears deferral)" },
     { value: "goal", description: "Manage the session goal: show | set <text> | clear | reset | here | draft" },
     { value: "compact", description: "Ask the agent to compact right now" },
     { value: "help", description: "Show this help" },
@@ -1267,7 +1337,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       ? pin.text.trim()
         ? `${pin.source === "seed" ? "seeded" : `custom (${pin.source})`}, ${pin.text.length} chars, updated ${pin.updatedAt.slice(0, 10)}`
         : `CLEARED (${pin.source}, ${pin.updatedAt.slice(0, 10)})`
-      : `floor ${state.persisted.minPinnedTurns} turn(s), seed pending`;
+      : state.persisted.goalSeedRequested
+        ? `seed pending (floor ${state.persisted.minPinnedTurns} turn(s))`
+        : "none — opt in with /self-propagate goal set|here|reset";
     const anchor = state.persisted.anchorEntryId
       ? `${state.persisted.anchorEntryId.slice(0, 12)}… (set via /self-propagate on here)`
       : "session start (default)";
@@ -1295,53 +1367,57 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     return [
       "Self-Propagate — contextual self-compaction for long sessions",
       "",
-      "When the budget fills, the agent writes its own checkpoint (summary + goal",
-      "context + KV working memory), wipes raw history, and resumes. Opt-in per",
-      "session; nothing is sent anywhere and nothing changes when disabled.",
+      "Compaction is ON by default: at the budget tiers the agent writes its own",
+      "checkpoint (summary + KV working memory, plus a goal if you set one), wipes",
+      "raw history, and resumes. Goal and wake are opt-in. /off disables everything.",
       "",
       "Usage: /self-propagate [subcommand]",
       "",
-      "  on [here]          Enable. `here` seeds the goal from your latest",
-      "                     user message (for mid-conversation); default seeds from",
-      "                     the session root. The seed floor is 1 turn.",
-      "  off                Disable; clears both wake timers, pending compaction, grace count.",
+      "  on                 Re-enable compaction after /off. No goal is created.",
+      "  on here            Also opt into a goal seeded from your latest user message",
+      "                     (the seed floor is 1 turn).",
+      "  off                Disable; clears goal opt-in, wake timers, pending compaction.",
       "  status             Full state: budget bar, goal, anchor, KV, timers.",
-      "  budget <0.3-0.95>  Effective ceiling as fraction of model window (default 0.85).",
+      "  budget <0.3-0.95>  Effective ceiling as fraction of model window (default 0.65).",
       "                     No argument prints the current value.",
       "  wake once <minutes>",
-      "                     Compact & pause: at ≥25% budget, after N minutes idle the",
+      "                     DEFAULT 45m. Once per idle streak, after N minutes idle",
+      "                     (and only when the prefix is over the reclaim gate), the",
       "                     agent persists notes and self_compact(continueAfter: false).",
-      "                     Fires once per idle streak. 0 disables.",
+      "                     0 disables the nudge.",
       "  wake every <minutes>",
-      "                     Wake tick: every N minutes idle, the agent reviews objectives",
-      "                     and keeps working (or compacts if budget is high).",
-      "                     Auto-enables self-propagation. 0 disables.",
+      "                     OPT-IN repeating cron: every N minutes idle the agent",
+      "                     reviews objectives and keeps working. Takes precedence over",
+      "                     `once`. 0 disables.",
       "  wake off           Disable both wake modes and any active deferral. No argument shows both values.",
-      "  goal [show]        Show the session goal (the mandate re-baked into every",
-      "                     checkpoint). You can keep/edit/skip it when enabling.",
+      "  goal [show]        Show the session goal (opt-in; none by default). `on here`",
+      "                     offers keep/edit/skip when seeding one.",
       "  goal set <text>    Replace the goal with <text>.",
       "  goal clear         Clear the goal — no mandate re-injected after compaction.",
-      "  goal reset         Discard the custom goal; re-seed from the branch next compaction.",
+      "  goal reset         Discard the current goal and re-seed from the branch at the next compaction.",
       "  goal here          Pin the latest user message as the goal.",
       "  goal draft         Ask the agent to propose a new goal; you approve before it lands.",
       "  compact            Ask the agent to compact right now.",
       "  help               This help (also the default for bare /self-propagate).",
       "",
       "Notes",
+      "  Default wake: one self-compact nudge after 45m idle (once per idle streak,",
+      "  and only when the prefix is worth reclaiming). `wake every` is opt-in,",
+      "  so Orca's own wake events stay in charge of ordinary idle activity.",
       "  Goal edits take effect at the NEXT compaction; `compact` applies them now.",
-      "  Writing the goal to the file itself never enters context and never busts the cache.",
-      "  The agent can propose goal changes via the goal_set tool, but they",
-      "  apply only with your approval.",
+      "  The agent can propose goal changes via goal_set once a goal is opted into,",
+      "  but they apply only with your approval.",
       "",
       "Related tooling",
-      "  self_compact, memory_store, goal_set, wake_defer   Tools, only declared while enabled.",
+      "  self_compact, memory_store   Declared by default with compaction.",
+      "  goal_set, wake_defer         Declared only after goal/wake opt-in.",
       "  .pi/memory/<session>.json                 KV notes + goal + flags; survives /reload and resume.",
     ].join("\n");
   }
 
   pi.registerCommand("self-propagate", {
     description:
-      "Self-propagation for long sessions: /self-propagate help | on [here] | off | status | budget <0.3-0.95> | wake <once|every> <minutes> | wake off | goal <show|set|clear|reset|here|draft> | compact",
+      "Self-propagation (compaction on by default; goal/wake opt-in): /self-propagate help | on [here] | off | status | budget <0.3-0.95> | wake <once|every> <minutes> | wake off | goal <show|set|clear|reset|here|draft> | compact",
     getArgumentCompletions: (prefix: string) => {
       const lower = prefix.toLowerCase();
       const firstSpace = lower.indexOf(" ");
@@ -1362,10 +1438,10 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       if (first === "on")
         return suggest(["here"], () => "Seed the goal from your latest user message");
       if (first === "budget")
-        return suggest(["0.5", "0.7", "0.85", "0.9"], (v) => `Ceiling ${Math.round(parseFloat(v) * 100)}% of model window`);
+        return suggest(["0.5", "0.65", "0.7", "0.85"], (v) => `Ceiling ${Math.round(parseFloat(v) * 100)}% of model window`);
       if (first === "wake") {
         const WAKE_HELP: Record<string, string> = {
-          once: "Compact & pause once when idle (≥25% budget)",
+          once: "One self-compact nudge per idle streak (default 45m)",
           every: "Wake tick every N minutes; agent keeps working",
           off: "Disable both wake modes",
         };
@@ -1435,25 +1511,30 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           // A user/agent-rewritten pin is never touched silently.
           const pin = state.persisted.pinnedContext;
           if (!pin) {
-            seedNote = "";
+            state.persisted.goalSeedRequested = true;
           } else if (pin.source === "seed") {
             state.persisted.pinnedContext = null;
+            state.persisted.goalSeedRequested = true;
             seedNote = " The existing seed pin will be re-created from this turn at the next compaction.";
           } else {
-            seedNote = " Existing custom pin kept — run /self-propagate pin reset to re-seed from this turn instead.";
+            seedNote = " Existing custom pin kept — run /self-propagate goal reset to re-seed from this turn instead.";
           }
         }
 
-        // Tool the user up with a goal: seed it explicitly, confirm interactively,
-        // or (headless) keep the seed silently. Off by default only if the user skips.
-        const goalSetup = await setupGoalOnEnable(ctx, option);
-        const goalNote = goalSetup.note ? ` ${goalSetup.note}` : "";
+        // `on here` is the explicit goal opt-in; plain `on` only re-enables
+        // compaction and never creates a goal.
+        let goalNote = "";
+        if (option === "here") {
+          const goalSetup = await setupGoalOnEnable(ctx, option);
+          goalNote = goalSetup.note ? ` ${goalSetup.note}` : "";
+        }
 
         saveState(ctx);
         syncToolVisibility();
+        ensureGlobalWatchdog();
         updateFooterStatus(ctx);
         ctx.ui.notify(
-          `Self-propagation ENABLED (${state.persisted.anchorEntryId ? "anchor: current turn" : "anchor: session start"}, ceiling ${Math.round(state.persisted.budgetRatio * 100)}% of model window). /self-propagate status for details, /self-propagate help for usage.${seedNote}${goalNote}`,
+          `Self-propagation ENABLED (compaction ${Math.round(state.persisted.budgetRatio * 100)}% ceiling${state.persisted.anchorEntryId ? ", anchor: current turn" : ""}). /self-propagate status for details, /self-propagate help for usage.${seedNote}${goalNote}`,
           "info"
         );
         return;
@@ -1461,6 +1542,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
       if (sub === "off") {
         state.persisted.enabled = false;
+        state.persisted.goalSeedRequested = false;
         state.persisted.keepAwakeMinutes = 0;
         state.persisted.idleCompactMinutes = 0;
         state.persisted.idleCompactWarned = false;
@@ -1469,6 +1551,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         state.persisted.wakeDeferredUntil = 0;
         saveState(ctx);
         syncToolVisibility();
+        ensureGlobalWatchdog();
         updateFooterStatus(ctx);
         ctx.ui.notify("Self-propagation DISABLED for this session. /self-propagate on to re-enable.", "info");
         return;
@@ -1477,14 +1560,14 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       if (sub === "budget") {
         if (!parts[1]) {
           ctx.ui.notify(
-            `Budget ceiling is ${Math.round(state.persisted.budgetRatio * 100)}% of model window. Set it with /self-propagate budget <0.3-0.95> (e.g. 0.85).`,
+            `Budget ceiling is ${Math.round(state.persisted.budgetRatio * 100)}% of model window. Set it with /self-propagate budget <0.3-0.95> (e.g. 0.65).`,
             "info"
           );
           return;
         }
         const val = parseFloat(parts[1]);
         if (isNaN(val) || val < 0.3 || val > 0.95) {
-          ctx.ui.notify("Budget ratio must be between 0.30 and 0.95 (e.g. 0.85).", "warning");
+          ctx.ui.notify("Budget ratio must be between 0.30 and 0.95 (e.g. 0.65).", "warning");
           return;
         }
         state.persisted.budgetRatio = val;
@@ -1513,6 +1596,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           state.persisted.idleCompactWarned = false;
           state.persisted.wakeDeferredUntil = 0;
           saveState(ctx);
+          syncToolVisibility();
+          ensureGlobalWatchdog();
           updateFooterStatus(ctx);
           ctx.ui.notify("Wake timers disabled.", "info");
           return;
@@ -1524,31 +1609,37 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
             return;
           }
           if (mode === "once") {
+            if (mins > 0) state.persisted.enabled = true;
             state.persisted.idleCompactMinutes = mins;
             state.persisted.keepAwakeMinutes = 0; // once-mode only fires when the every-timer is off
             state.persisted.wakeDeferredUntil = 0;
             saveState(ctx);
+            syncToolVisibility();
+            ensureGlobalWatchdog();
             updateFooterStatus(ctx);
             ctx.ui.notify(
               mins === 0
                 ? "Wake-once disabled."
-                : `Wake-once set to ${mins}m: after ${mins}m idle at ≥25% budget the agent persists notes and self_compact (pause). Once per idle streak.`,
+                : `Wake-once set to ${mins}m: after ${mins}m idle with a reclaimable prefix, the agent persists notes and self_compact (pause). Once per idle streak.`,
               "info"
             );
           } else {
             if (mins === 0) {
               state.persisted.keepAwakeMinutes = 0;
               saveState(ctx);
+              syncToolVisibility();
+              ensureGlobalWatchdog();
               updateFooterStatus(ctx);
               ctx.ui.notify("Wake-every disabled.", "info");
               return;
             }
-            state.persisted.enabled = true; // Auto-enable propagation if wake-every is turned on
+            state.persisted.enabled = true;
             state.persisted.keepAwakeMinutes = mins;
             state.lastActiveAt = Date.now();
             state.persisted.wakeDeferredUntil = 0;
             saveState(ctx);
             syncToolVisibility();
+            ensureGlobalWatchdog();
             updateFooterStatus(ctx);
             ctx.ui.notify(
               `Wake-every enabled: session will wake after ${mins}m of inactivity (Self-propagation enabled).`,
@@ -1578,7 +1669,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         if (action === "show" || action === "s") {
           if (!pin) {
             ctx.ui.notify(
-              `No goal set yet — it seeds from ${seedDesc} at the first checkpoint, or /self-propagate goal here pins the current user message instead.`,
+              `No goal set (none is created by default). Use /self-propagate goal set <text>, goal here, or goal reset to seed from ${seedDesc}.`,
               "info"
             );
             return;
@@ -1614,7 +1705,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
             return;
           }
           setPinnedContext(rest, "user");
+          state.persisted.goalSeedRequested = false;
           saveState(ctx);
+          syncToolVisibility();
           ctx.ui.notify(
             `Goal set (user, ${rest.length} chars). Applies at the next compaction — /self-propagate compact to apply now.`,
             "info"
@@ -1623,8 +1716,10 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         }
 
         if (action === "clear") {
-          setPinnedContext("", "user");
+          state.persisted.pinnedContext = null;
+          state.persisted.goalSeedRequested = false;
           saveState(ctx);
+          syncToolVisibility();
           ctx.ui.notify(
             "Goal CLEARED — no mandate will be re-injected after compaction. /self-propagate goal reset to re-seed.",
             "warning"
@@ -1634,7 +1729,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
         if (action === "reset") {
           state.persisted.pinnedContext = null;
+          state.persisted.goalSeedRequested = true;
           saveState(ctx);
+          syncToolVisibility();
           ctx.ui.notify(
             `Goal reset — re-seeded from ${seedDesc} at the next compaction (floor ${state.persisted.minPinnedTurns} turn).`,
             "info"
@@ -1650,7 +1747,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           }
           const text = `[Goal pinned from the current user message]:\n${msg.slice(0, MAX_ORIGIN_TURN_CHARS)}`;
           setPinnedContext(text, "user");
+          state.persisted.goalSeedRequested = false;
           saveState(ctx);
+          syncToolVisibility();
           ctx.ui.notify(
             `Goal set from the latest user message (${text.length} chars). Applies at the next compaction — /self-propagate compact to apply now.`,
             "info"
@@ -1666,6 +1765,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
             );
             return;
           }
+          state.persisted.goalSeedRequested = true;
+          saveState(ctx);
+          syncToolVisibility();
           pi.sendUserMessage(
             `<goal_set_request>The user asked you to draft a replacement for the session goal (the standing mandate re-injected into every checkpoint). Review the current goal and the session's trajectory, then call goal_set with the new text and a reason — the user will approve or reject it.</goal_set_request>`,
             { deliverAs: "steer" }
@@ -1734,6 +1836,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     loadState(ctx); // restores durable state, including any queued checkpoint
     state.lastActiveAt = Date.now(); // idle clock restarts with the session
     syncToolVisibility();
+    ensureGlobalWatchdog();
     updateFooterStatus(ctx);
     if (state.persisted.pendingCompaction) {
       ctx.ui?.notify?.(
@@ -1769,16 +1872,16 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       state.persisted.overBudgetTurns += 1;
       const remainingGrace = Math.max(
         0,
-        GRACE_TURNS_AT_100 - state.persisted.overBudgetTurns + 1
+        state.persisted.graceTurns - state.persisted.overBudgetTurns + 1
       );
-      if (state.persisted.overBudgetTurns <= GRACE_TURNS_AT_100) {
+      if (state.persisted.overBudgetTurns <= state.persisted.graceTurns) {
         budgetAlert =
-          `[CRITICAL CONTEXT ALERT — 100% BUDGET REACHED (${tokens}/${budgetCeiling} tokens) — GRACE TURN ${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100}]\n` +
+          `[CRITICAL CONTEXT ALERT — 100% BUDGET REACHED (${tokens}/${budgetCeiling} tokens) — GRACE TURN ${state.persisted.overBudgetTurns}/${state.persisted.graceTurns}]\n` +
           `You MUST wrap up your current thought and call \`self_compact\` within ${remainingGrace} turn(s). ` +
-          `After turn ${GRACE_TURNS_AT_100}, all tools except \`self_compact\` and \`memory_store\` will be HARD-LOCKED.`;
+          `After turn ${state.persisted.graceTurns}, all tools except \`self_compact\` and \`memory_store\` will be HARD-LOCKED.`;
       } else {
         budgetAlert =
-          `[HARD CONTEXT LOCK ENGAGED — GRACE PERIOD EXPIRED (${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100} turns over 100%)]\n` +
+          `[HARD CONTEXT LOCK ENGAGED — GRACE PERIOD EXPIRED (${state.persisted.overBudgetTurns}/${state.persisted.graceTurns} turns over 100%)]\n` +
           `All standard tools are now blocked. You MUST call \`self_compact\` immediately.`;
       }
     } else {
@@ -1796,15 +1899,10 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     updateFooterStatus(ctx);
     saveState(ctx); // persist overBudgetTurns / idleCompactWarned changes
 
-    // Nudge a goal-less session's agent into proposing one (turns off once set).
-    const goalNudge = state.persisted.pinnedContext
-      ? ""
-      : `\n- No session goal set. Propose one via \`goal_set\` (the user must approve) — it re-injects at the next compaction and keeps long-horizon work anchored.`;
-
     // The volatile budget state never enters the head — only the stable protocol
     // block (with its model-relative ceiling line) is appended to the system prompt.
     return {
-      systemPrompt: (event.systemPrompt || "") + renderProtocolBlock(ctx, state.persisted) + goalNudge,
+      systemPrompt: (event.systemPrompt || "") + renderProtocolBlock(ctx, state.persisted),
       ...(budgetAlert
         ? {
             message: {
@@ -1818,7 +1916,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     };
   });
 
-  // Gate tool execution when pending compaction OR when grace turns > 5
+  // Gate tool execution when pending compaction OR when grace turns are exhausted
   pi.on("tool_call", async (event, ctx) => {
     if (!state.persisted.enabled) return;
 
@@ -1833,13 +1931,13 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     const { budgetPercent } = getBudgetMetrics(ctx);
     if (
       budgetPercent >= 100 &&
-      state.persisted.overBudgetTurns > GRACE_TURNS_AT_100 &&
+      state.persisted.overBudgetTurns > state.persisted.graceTurns &&
       event.toolName !== "self_compact" &&
       event.toolName !== "memory_store"
     ) {
       return {
         block: true,
-        reason: `HARD CONTEXT LOCK: Context is at ${budgetPercent}% of budget and you exceeded the ${GRACE_TURNS_AT_100}-turn grace period. Call self_compact immediately.`,
+        reason: `HARD CONTEXT LOCK: Context is at ${budgetPercent}% of budget and you exceeded the ${state.persisted.graceTurns}-turn grace period. Call self_compact immediately.`,
       };
     }
   });
@@ -1853,7 +1951,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
     let tag = `[Context: ${budgetPercent}% (${Math.round(tokens / 1000)}k/${Math.round(budgetCeiling / 1000)}k)]`;
     if (budgetPercent >= 100) {
-      tag = `[CRITICAL 100% CONTEXT (${budgetPercent}%) — Grace Turn ${state.persisted.overBudgetTurns}/${GRACE_TURNS_AT_100}: CALL self_compact NOW]`;
+      tag = `[CRITICAL 100% CONTEXT (${budgetPercent}%) — Grace Turn ${state.persisted.overBudgetTurns}/${state.persisted.graceTurns}: CALL self_compact NOW]`;
     } else if (budgetPercent >= 75) {
       tag = `[WARNING 75%+ CONTEXT (${budgetPercent}%) — Prepare to call self_compact at next checkpoint]`;
     }
@@ -1882,6 +1980,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   // drop the cut (the checkpoint still rides this request's head) and let the
   // user/agent re-establish it with a fresh self_compact once context grows.
   pi.on("context", (event: any, ctx: ExtensionContext) => {
+    if (!state.persisted.enabled) return;
     const cut = state.persisted.cut;
     if (!cut) return;
     const msgs: any[] = Array.isArray(event?.messages) ? event.messages : [];

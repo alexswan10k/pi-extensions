@@ -68,7 +68,16 @@ const notified = (s) => s.notifyLog.join("\n---\n");
 // ---- Phase 1: a session does work and is then "killed" mid-crisis -------------
 const s1 = boot("sess-a");
 await s1.events.session_start({}, s1.ctx);
-assert.equal(s1.activeTools.includes("self_compact"), false, "tools hidden before opt-in");
+assert.equal(s1.activeTools.includes("self_compact"), true, "compaction tools active by default");
+assert.equal(s1.activeTools.includes("memory_store"), true, "memory tool active by default");
+assert.equal(s1.activeTools.includes("goal_set"), false, "goal tool hidden until goal opt-in");
+assert.equal(s1.activeTools.includes("wake_defer"), true, "deferral tool active with the default idle nudge");
+await s1.events.before_agent_start({ systemPrompt: "base" }, s1.ctx); // persists the fresh defaults
+assert.equal(s1.readMemory().budgetRatio, 0.65, "aggressive ceiling is the default");
+assert.equal(s1.readMemory().keepAwakeMinutes, 0, "repeating wake cron off by default");
+assert.equal(s1.readMemory().idleCompactMinutes, 45, "one idle self-compact nudge after 45m by default");
+assert.equal(s1.readMemory().goalSeedRequested, false, "no goal by default");
+assert.ok(globalThis.__pi_self_propagate_timer_v1__, "idle-nudge watchdog installed by default");
 
 await s1.commands["self-propagate"].handler("on here", s1.ctx);
 await s1.commands["self-propagate"].handler("budget 0.7", s1.ctx);
@@ -217,7 +226,7 @@ assert.doesNotMatch(cutB.checkpoint.split("</pinned_context>")[0], /ALWAYS RUN T
 await s2.commands["self-propagate"].handler("goal clear", s2.ctx);
 await s2.tools.self_compact.execute("t11", { summary: "checkpoint after clear", continueAfter: false }, undefined, undefined, s2.ctx);
 const cutC = await applyCut(s2);
-assert.match(cutC.checkpoint, /<pinned_context status="empty"/, "cleared goal renders the empty marker");
+assert.doesNotMatch(cutC.checkpoint, /<pinned_context/, "cleared goal renders no block at all");
 
 // ---- Episode D: goal reset re-seeds from the branch -------------------------
 await s2.commands["self-propagate"].handler("goal reset", s2.ctx);
@@ -238,12 +247,18 @@ const s3 = boot("sess-a");
 await s3.events.session_start({}, s3.ctx);
 const s3out = notified(s3);
 assert.doesNotMatch(s3out, /restored/, "corrupt file: nothing restored");
-assert.equal(s3.activeTools.includes("self_compact"), false, "corrupt file: tools stay hidden");
+assert.equal(s3.activeTools.includes("self_compact"), true, "corrupt file: compaction falls back to on");
+assert.equal(s3.activeTools.includes("goal_set"), false, "corrupt file: goal stays opt-in");
 
 // ---- Phase 4: a different session does not see this session's state ------------
 const s4 = boot("sess-b");
 await s4.events.session_start({}, s4.ctx);
 assert.equal(fs.existsSync(path.join(dir, ".pi", "memory", "sess-b.json")), false, "other sessions get no reuse of this session's memory file");
+await s4.commands["self-propagate"].handler("compact", s4.ctx);
+assert.match(s4.sent.at(-1).msg, /force_compact/, "compact works by default, no opt-in needed");
+await s4.commands["self-propagate"].handler("goal", s4.ctx);
+assert.match(notified(s4), /No goal set/i, "goal reports none by default instead of refusing");
+await s4.commands["self-propagate"].handler("off", s4.ctx);
 await s4.commands["self-propagate"].handler("compact", s4.ctx);
 assert.match(notified(s4), /disabled/i, "compact refuses while disabled");
 await s4.commands["self-propagate"].handler("goal", s4.ctx);
@@ -253,17 +268,18 @@ const list4 = await s4.tools.memory_store.execute("l4", { action: "list" }, unde
 assert.match(list4.content[0].text, /empty/i, "fresh session starts with an empty KV store");
 
 // ---- Phase 5: minPinnedTurns below the floor in storage is clamped on load ------
-fs.writeFileSync(s2.memoryFile, JSON.stringify({ enabled: true, minPinnedTurns: 0, budgetRatio: 0.85, pinnedContext: { text: 42, source: 9, updatedAt: 5 } }));
+fs.writeFileSync(s2.memoryFile, JSON.stringify({ enabled: true, minPinnedTurns: 0, budgetRatio: 0.85, goalSeedRequested: true, pinnedContext: { text: 42, source: 9, updatedAt: 5 } }));
 const s5 = boot("sess-a");
 await s5.events.session_start({}, s5.ctx); // must not crash; malformed pinnedContext loads as unseeded
 await s5.commands["self-propagate"].handler("status", s5.ctx);
-assert.match(notified(s5), /floor 1 turn/, "minPinnedTurns=0 loads as floor 1; malformed goal drops to unseeded");
+assert.match(notified(s5), /seed pending \(floor 1 turn/, "minPinnedTurns=0 loads as floor 1; malformed goal drops to unseeded");
 
 // ---- Phase 6: dead anchor still yields a seed (root fallback, with a warning) ---
 fs.writeFileSync(
 	path.join(dir, ".pi", "memory", "sess-dead.json"),
 	JSON.stringify({
 		enabled: true,
+		goalSeedRequested: true,
 		anchorEntryId: "no-such-entry",
 		pendingCompaction: { summary: "checkpoint despite dead anchor", keepFirstTurns: 0, continueAfter: false },
 	})
@@ -281,7 +297,7 @@ fs.writeFileSync(
 	path.join(dir, ".pi", "memory", "sess-lock.json"),
 	JSON.stringify({ enabled: true, overBudgetTurns: 6 })
 );
-const s7 = boot("sess-lock", { tokens: 95000 }); // 95000/85000 = 112% of ceiling
+const s7 = boot("sess-lock", { tokens: 95000 }); // 95000/65000 = 146% of the default ceiling
 await s7.events.session_start({}, s7.ctx);
 const beforeLock = await s7.events.before_agent_start({ systemPrompt: "base" }, s7.ctx);
 assert.match(beforeLock.message?.content ?? "", /HARD CONTEXT LOCK/, "grace period expired: hard lock directive fires as a message");
@@ -302,8 +318,8 @@ const s9 = boot("sess-skip");
 s9.selectQueue.push("skip");
 await s9.events.session_start({}, s9.ctx);
 await s9.commands["self-propagate"].handler("on here", s9.ctx);
-assert.equal(s9.readMemory().pinnedContext?.text, "", "skip stores a deliberate empty goal");
-assert.equal(s9.readMemory().pinnedContext?.source, "user", "skip is a user decision, not a seed");
+assert.equal(s9.readMemory().pinnedContext, null, "skip leaves no goal at all");
+assert.equal(s9.readMemory().goalSeedRequested, false, "skip never re-seeds lazily");
 const skipOut = await s9.events.before_agent_start({ systemPrompt: "base" }, s9.ctx);
 assert.doesNotMatch(skipOut.systemPrompt, /No session goal set/, "skip disables the no-goal nudge");
 
@@ -311,13 +327,14 @@ assert.doesNotMatch(skipOut.systemPrompt, /No session goal set/, "skip disables 
 fs.writeFileSync(path.join(dir, ".pi", "memory", "sess-fail.json"), JSON.stringify({ enabled: true }));
 const s10 = boot("sess-fail");
 await s10.events.session_start({}, s10.ctx);
-assert.equal(s10.activeTools.includes("wake_defer"), true, "wake_defer declared after opt-in");
+assert.equal(s10.activeTools.includes("wake_defer"), true, "wake_defer declared with the default 45m idle nudge");
 await s10.tools.self_compact.execute("f1", { summary: "mid-flight checkpoint", continueAfter: false }, undefined, undefined, s10.ctx);
 assert.equal(s10.readMemory().pendingCompaction?.summary, "mid-flight checkpoint", "checkpoint queued at tool time");
 await s10.events.agent_end({}, s10.ctx);
 assert.equal(s10.readMemory().pendingCompaction, null, "checkpoint applied at turn end");
 assert.ok(s10.readMemory().cut, "cut boundary persisted — no pi compaction involved");
 assert.match(s10.readMemory().cut.checkpoint, /mid-flight checkpoint/, "agent summary baked into the checkpoint");
+assert.doesNotMatch(s10.readMemory().cut.checkpoint, /<pinned_context/, "no goal means no pinned_context block");
 const failMsgs = BRANCH.map((e) => e.message);
 const failElided = await s10.events.context({ messages: failMsgs }, s10.ctx);
 assert.equal(failElided.messages.length, 1, "pre-cut history elided even for a tiny session");
@@ -402,6 +419,57 @@ assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or
   const d = await s14.tools.wake_defer.execute("m1", { minutes: 60 }, undefined, undefined, s14.ctx);
   assert.equal(d.details.autoCompaction, true, "legacy file => bootstrap floor => 28k is over the gate (NaN-safe)");
   assert.ok(s14.readMemory().cacheFloorTokens > 0, "the field is re-persisted on the next save");
+}
+
+// ---- Phase 12: off stops elision, on restores it ---------------------------
+{
+  const s = boot("sess-off");
+  await s.events.session_start({}, s.ctx);
+  await s.tools.self_compact.execute("o1", { summary: "off/on elision", continueAfter: false }, undefined, undefined, s.ctx);
+  await s.events.agent_end({}, s.ctx);
+  const msgs = BRANCH.map((e) => e.message);
+  assert.equal((await s.events.context({ messages: msgs }, s.ctx)).messages.length, 1, "active cut elides history");
+  await s.commands["self-propagate"].handler("off", s.ctx);
+  assert.equal(await s.events.context({ messages: msgs }, s.ctx), undefined, "/off stops the elision (hook no-ops)");
+  await s.commands["self-propagate"].handler("on", s.ctx);
+  assert.equal((await s.events.context({ messages: msgs }, s.ctx)).messages.length, 1, "/on restores the persisted cut");
+}
+
+// ---- Phase 13: legacy files keep their grace/idle, junk scalars fall back ----
+{
+  const file = path.join(dir, ".pi", "memory", "sess-legacy.json");
+  fs.writeFileSync(file, JSON.stringify({ enabled: true, budgetRatio: 0.85 }));
+  const s = boot("sess-legacy");
+  await s.events.session_start({}, s.ctx);
+  await s.events.before_agent_start({ systemPrompt: "base" }, s.ctx);
+  assert.equal(s.readMemory().graceTurns, 5, "legacy opt-in keeps the 5-turn grace");
+  assert.equal(s.readMemory().idleCompactMinutes, 15, "legacy opt-in keeps the 15m idle nudge");
+  assert.equal(s.readMemory().budgetRatio, 0.85, "legacy ceiling unchanged");
+
+  const junkFile = path.join(dir, ".pi", "memory", "sess-junk.json");
+  fs.writeFileSync(junkFile, JSON.stringify({ enabled: true, budgetRatio: "nope", cacheFloorTokens: "x" }));
+  const j = boot("sess-junk");
+  await j.events.session_start({}, j.ctx);
+  await j.events.before_agent_start({ systemPrompt: "base" }, j.ctx);
+  assert.equal(j.readMemory().budgetRatio, 0.65, "NaN budget falls back to the default");
+  assert.equal(j.readMemory().cacheFloorTokens, 20000, "NaN floor falls back to bootstrap");
+}
+
+// ---- Phase 14: wake once re-enables a disabled session; goal_set("") clears --
+{
+  const s = boot("sess-rewake");
+  await s.events.session_start({}, s.ctx);
+  await s.commands["self-propagate"].handler("off", s.ctx);
+  assert.equal(s.readMemory().enabled, false, "off disables");
+  await s.commands["self-propagate"].handler("wake once 10", s.ctx);
+  assert.equal(s.readMemory().enabled, true, "wake once re-enables compaction");
+  assert.equal(s.activeTools.includes("wake_defer"), true, "deferral tool comes back with it");
+  await s.commands["self-propagate"].handler("goal set KEEP THIS", s.ctx);
+  assert.equal(s.activeTools.includes("goal_set"), true, "goal opt-in activates goal_set");
+  s.confirmQueue.push(true);
+  await s.tools.goal_set.execute("c1", { text: "", reason: "no longer needed" }, undefined, undefined, s.ctx);
+  assert.equal(s.readMemory().pinnedContext, null, "approved empty goal_set clears the goal");
+  assert.equal(s.activeTools.includes("goal_set"), false, "goal_set hides again after the clear");
 }
 
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
