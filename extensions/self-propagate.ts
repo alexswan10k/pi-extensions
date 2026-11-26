@@ -90,6 +90,7 @@ interface PersistedSessionState {
   idleCompactMinutes: number; // 45 = one self-compact nudge after 45m idle (default); 0 = off
   settleCompact: boolean;
   settleNudgePending: boolean;
+  settleCompacted: boolean;
   minPinnedTurns: number; // Seed floor for the initial goal (default 1) — applies until pinnedContext is set
   anchorEntryId: string | null; // null = session root; set via `/self-propagate on here`
   goalSeedRequested: boolean; // true only after an explicit goal opt-in; gates lazy seeding
@@ -149,6 +150,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       idleCompactMinutes: DEFAULT_IDLE_COMPACT_MINUTES,
       settleCompact: true,
       settleNudgePending: false,
+      settleCompacted: false,
       minPinnedTurns: 1,
       anchorEntryId: null,
       goalSeedRequested: false,
@@ -252,6 +254,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           ),
           settleCompact: raw.settleCompact !== false,
           settleNudgePending: Boolean(raw.settleNudgePending ?? false),
+          settleCompacted: Boolean(raw.settleCompacted ?? false),
           minPinnedTurns: Math.max(1, Number(raw.minPinnedTurns ?? 1) || 1),
           anchorEntryId:
             typeof raw.anchorEntryId === "string" && raw.anchorEntryId ? raw.anchorEntryId : null,
@@ -280,6 +283,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       idleCompactMinutes: DEFAULT_IDLE_COMPACT_MINUTES,
       settleCompact: true,
       settleNudgePending: false,
+      settleCompacted: false,
       minPinnedTurns: 1,
       anchorEntryId: null,
       goalSeedRequested: false,
@@ -804,6 +808,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     state.persisted.cut = { checkpoint, prefixCount, anchorRole: anchor.role, anchorSample: anchor.sample, createdAt };
     state.persisted.pendingCompaction = null;
     state.persisted.overBudgetTurns = 0;
+    state.persisted.settleCompacted = true;
     state.persisted.idleCompactWarned = false;
     state.awaitingFloorMeasurement = true;
     state.lastActiveAt = Date.now();
@@ -912,7 +917,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         // per idle streak when the prefix is worth reclaiming.
         if (
           state.persisted.idleCompactMinutes > 0 &&
-          !state.persisted.settleCompact &&
+          !(state.persisted.settleCompact && state.persisted.settleCompacted) &&
           !state.persisted.idleCompactWarned &&
           idleMs >= state.persisted.idleCompactMinutes * 60_000 &&
           pressure
@@ -1422,7 +1427,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       "  so Orca's own wake events stay in charge of ordinary idle activity.",
       "  Settle poke (on by default): when a run settles, the agent is asked to",
       "  self-compact if nothing is running in the background, so a chat that Orca",
-      "  tears down leaves a checkpoint. It fires once per incoming message.",
+      "  tears down leaves a checkpoint. It fires once per incoming message; if the",
+      "  agent declines, the 45m idle nudge still applies as a second chance.",
       "  Goal edits take effect at the NEXT compaction; `compact` applies them now.",
       "  The agent can propose goal changes via goal_set once a goal is opted into,",
       "  but they apply only with your approval.",
@@ -1588,6 +1594,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         state.persisted.idleCompactMinutes = DEFAULT_IDLE_COMPACT_MINUTES;
         state.persisted.settleCompact = true;
         state.persisted.settleNudgePending = false;
+        state.persisted.settleCompacted = false;
         state.persisted.overBudgetTurns = 0;
         state.persisted.idleCompactWarned = false;
         state.persisted.wakeDeferredUntil = 0;
@@ -1703,6 +1710,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         if (mode === "on" || mode === "off") {
           state.persisted.settleCompact = mode === "on";
           state.persisted.settleNudgePending = false;
+          state.persisted.settleCompacted = false;
           saveState(ctx);
           ctx.ui.notify(`Settle-time compaction poke ${mode === "on" ? "enabled" : "disabled"}.`, "info");
           return;
@@ -1921,6 +1929,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       !/(settle_compact_poke|self_propagation_resume|force_compact|keep_awake_tick)/.test(prompt)
     ) {
       state.persisted.settleNudgePending = false;
+      state.persisted.settleCompacted = false;
     }
 
     // Self-calibrating floor: the first request after a compaction measures the
@@ -2092,7 +2101,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     state.latestCtx = ctx;
     if (!state.persisted.enabled || !state.persisted.settleCompact) return;
     if (event.aborted || state.isCompacting || state.persisted.pendingCompaction) return;
-    if (state.persisted.settleNudgePending) return;
+    if (state.persisted.settleCompacted || state.persisted.settleNudgePending) return;
     state.persisted.settleNudgePending = true;
     saveState(ctx);
     pi.sendUserMessage(SETTLE_COMPACT_POKE, { deliverAs: "steer" });

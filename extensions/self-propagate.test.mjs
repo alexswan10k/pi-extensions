@@ -502,6 +502,7 @@ assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or
   await s.events.before_agent_start({ systemPrompt: "base" }, s.ctx);
   assert.equal(s.readMemory().settleCompact, true, "settle poke on by default");
   assert.equal(s.readMemory().settleNudgePending, false, "no poke pending at boot");
+  assert.equal(s.readMemory().settleCompacted, false, "no compaction recorded at boot");
 
   await s.events.agent_settled({ aborted: false }, s.ctx);
   assert.equal(s.sent.length, 1, "one poke at settle");
@@ -541,6 +542,56 @@ assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or
   await s.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: "real request" }, s.ctx);
   await s.events.agent_settled({ aborted: false }, s.ctx);
   assert.equal(s.sent.length, 3, "no poke when compaction is disabled");
+}
+
+// ---- Phase 17: settle compact wins; declined poke leaves the 45m second chance --
+{
+  const realSetInterval = globalThis.setInterval;
+  const realClearInterval = globalThis.clearInterval;
+  const realNow = Date.now;
+  let tick = null;
+  globalThis.setInterval = (fn) => { tick = fn; return 12345; };
+  globalThis.clearInterval = () => {};
+  delete globalThis.__pi_self_propagate_timer_v1__;
+  let now = realNow();
+  Date.now = () => now;
+  try {
+    const compacted = boot("sess-settle-compacted", { tokens: 30000 });
+    await compacted.events.session_start({}, compacted.ctx);
+    await compacted.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: "work" }, compacted.ctx);
+    await compacted.events.agent_settled({ aborted: false }, compacted.ctx);
+    assert.equal(compacted.sent.length, 1, "settle pokes");
+    await compacted.tools.self_compact.execute("c1", { summary: "done and compacted", continueAfter: false }, undefined, undefined, compacted.ctx);
+    await compacted.events.agent_end({}, compacted.ctx);
+    assert.equal(compacted.readMemory().settleCompacted, true, "compaction recorded for this cycle");
+    await compacted.events.agent_settled({ aborted: false }, compacted.ctx);
+    assert.equal(compacted.sent.length, 1, "no second poke once compacted");
+    now += 46 * 60_000;
+    await tick();
+    assert.equal(compacted.sent.length, 1, "45m watchdog suppressed after settle compaction");
+
+    const declined = boot("sess-settle-declined", { tokens: 30000 });
+    await declined.events.session_start({}, declined.ctx);
+    await declined.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: "work" }, declined.ctx);
+    await declined.events.agent_end({}, declined.ctx);
+    await declined.events.agent_settled({ aborted: false }, declined.ctx);
+    assert.equal(declined.sent.length, 1, "settle pokes");
+    await declined.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: declined.sent.at(-1).msg }, declined.ctx);
+    await declined.events.agent_end({}, declined.ctx);
+    await declined.events.agent_settled({ aborted: false }, declined.ctx);
+    assert.equal(declined.sent.length, 1, "no re-poke when the agent declines");
+    assert.equal(declined.readMemory().settleCompacted, false, "declined poke records no compaction");
+    now += 46 * 60_000;
+    await tick();
+    assert.equal(declined.sent.length, 2, "45m watchdog fires as the second chance");
+    assert.match(declined.sent.at(-1).msg, /keep_awake_tick/, "second chance is the idle pressure nudge");
+  } finally {
+    globalThis.setInterval = realSetInterval;
+    globalThis.clearInterval = realClearInterval;
+    Date.now = realNow;
+    clearInterval(globalThis.__pi_self_propagate_timer_v1__);
+    delete globalThis.__pi_self_propagate_timer_v1__;
+  }
 }
 
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
