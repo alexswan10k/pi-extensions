@@ -88,6 +88,8 @@ interface PersistedSessionState {
   budgetRatio: number; // Fraction of physical model contextWindow treated as 100% budget (default 0.65)
   keepAwakeMinutes: number; // 0 = disabled (default)
   idleCompactMinutes: number; // 45 = one self-compact nudge after 45m idle (default); 0 = off
+  settleCompact: boolean;
+  settleNudgePending: boolean;
   minPinnedTurns: number; // Seed floor for the initial goal (default 1) — applies until pinnedContext is set
   anchorEntryId: string | null; // null = session root; set via `/self-propagate on here`
   goalSeedRequested: boolean; // true only after an explicit goal opt-in; gates lazy seeding
@@ -134,6 +136,8 @@ interface RuntimeState {
 }
 
 const GLOBAL_TIMER_KEY = "__pi_self_propagate_timer_v1__";
+const SETTLE_COMPACT_POKE =
+  `<settle_compact_poke>At rest. If nothing is running in the background (tasks, subagents), call \`self_compact\` with continueAfter: false now so the session can be torn down safely; otherwise do nothing.</settle_compact_poke>`;
 
 export default function selfPropagateExtension(pi: ExtensionAPI) {
   const state: RuntimeState = {
@@ -143,6 +147,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       budgetRatio: DEFAULT_BUDGET_RATIO,
       keepAwakeMinutes: 0,
       idleCompactMinutes: DEFAULT_IDLE_COMPACT_MINUTES,
+      settleCompact: true,
+      settleNudgePending: false,
       minPinnedTurns: 1,
       anchorEntryId: null,
       goalSeedRequested: false,
@@ -244,6 +250,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
             0,
             1440
           ),
+          settleCompact: raw.settleCompact !== false,
+          settleNudgePending: Boolean(raw.settleNudgePending ?? false),
           minPinnedTurns: Math.max(1, Number(raw.minPinnedTurns ?? 1) || 1),
           anchorEntryId:
             typeof raw.anchorEntryId === "string" && raw.anchorEntryId ? raw.anchorEntryId : null,
@@ -270,6 +278,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       budgetRatio: DEFAULT_BUDGET_RATIO,
       keepAwakeMinutes: 0,
       idleCompactMinutes: DEFAULT_IDLE_COMPACT_MINUTES,
+      settleCompact: true,
+      settleNudgePending: false,
       minPinnedTurns: 1,
       anchorEntryId: null,
       goalSeedRequested: false,
@@ -589,7 +599,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
   // leading angle bracket from any closing/opening tag the checkpoint uses.
   function scrubContextTags(text: string): string {
     return text.replace(
-      /<(\/?)(pinned_context|working_memory|compaction_summary|note|idle_compaction_notice|keep_awake_tick|force_compact|goal_set_request|self_propagation_resume|self_propagation_compaction_failed)\b/gi,
+      /<(\/?)(pinned_context|working_memory|compaction_summary|note|idle_compaction_notice|keep_awake_tick|force_compact|goal_set_request|self_propagation_resume|self_propagation_compaction_failed|settle_compact_poke)\b/gi,
       "[$1$2"
     );
   }
@@ -902,6 +912,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         // per idle streak when the prefix is worth reclaiming.
         if (
           state.persisted.idleCompactMinutes > 0 &&
+          !state.persisted.settleCompact &&
           !state.persisted.idleCompactWarned &&
           idleMs >= state.persisted.idleCompactMinutes * 60_000 &&
           pressure
@@ -1303,6 +1314,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     { value: "status", description: "Full state: budget bar, goal, anchor, KV store, timers" },
     { value: "budget", description: "Set/show budget ceiling as fraction of model window (0.3–0.95, default 0.65)" },
     { value: "wake", description: "Idle nudge: `once <minutes>` (default 45m: self-compact once per idle streak) or `every <minutes>` (opt-in repeating cron) | `off` (clears deferral)" },
+    { value: "settle", description: "Settle-time compaction poke: `on|off|show` (on by default)" },
     { value: "goal", description: "Manage the session goal: show | set <text> | clear | reset | here | draft" },
     { value: "compact", description: "Ask the agent to compact right now" },
     { value: "help", description: "Show this help" },
@@ -1360,7 +1372,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       `  Budget   ${renderBudgetBar(budgetPercent)} ${budgetPercent}%  (${tokens}/${Math.round(budgetCeiling)} tokens; window ${physicalWindow}, ceiling ${Math.round(state.persisted.budgetRatio * 100)}%) — ${tier}`,
       `  Goal     ${pinDesc} | anchor: ${anchor}`,
       `  KV       ${kv}/${MAX_KV_ENTRIES} notes | file: .pi/memory/${currentSessionId(ctx).replace(/[^a-zA-Z0-9_-]/g, "_")}.json`,
-      `  Timers   wake every ${state.persisted.keepAwakeMinutes > 0 ? `${state.persisted.keepAwakeMinutes}m` : "off"} | wake once ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"}${deferDesc}`,
+      `  Timers   wake every ${state.persisted.keepAwakeMinutes > 0 ? `${state.persisted.keepAwakeMinutes}m` : "off"} | wake once ${state.persisted.idleCompactMinutes > 0 ? `${state.persisted.idleCompactMinutes}m` : "off"} | settle ${state.persisted.settleCompact ? "on" : "off"}${deferDesc}`,
     ].join("\n");
   }
 
@@ -1393,6 +1405,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       "                     reviews objectives and keeps working. Takes precedence over",
       "                     `once`. 0 disables.",
       "  wake off           Disable both wake modes and any active deferral. No argument shows both values.",
+      "  settle on|off|show At rest, ask the agent to self-compact if nothing is running in the background. On by default; no argument shows the current value.",
       "  goal [show]        Show the session goal (opt-in; none by default). `on here`",
       "                     offers keep/edit/skip when seeding one.",
       "  goal set <text>    Replace the goal with <text>.",
@@ -1407,6 +1420,9 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
       "  Default wake: one self-compact nudge after 45m idle (once per idle streak,",
       "  and only when the prefix is worth reclaiming). `wake every` is opt-in,",
       "  so Orca's own wake events stay in charge of ordinary idle activity.",
+      "  Settle poke (on by default): when a run settles, the agent is asked to",
+      "  self-compact if nothing is running in the background, so a chat that Orca",
+      "  tears down leaves a checkpoint. It fires once per incoming message.",
       "  Goal edits take effect at the NEXT compaction; `compact` applies them now.",
       "  The agent can propose goal changes via goal_set once a goal is opted into,",
       "  but they apply only with your approval.",
@@ -1420,7 +1436,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
 
   pi.registerCommand("self-propagate", {
     description:
-      "Self-propagation (compaction on by default; goal/wake opt-in): /self-propagate help | on [here] | off | reset | status | budget <0.3-0.95> | wake <once|every> <minutes> | wake off | goal <show|set|clear|reset|here|draft> | compact",
+      "Self-propagation (compaction on by default; goal/wake opt-in): /self-propagate help | on [here] | off | reset | status | budget <0.3-0.95> | wake <once|every> <minutes> | wake off | settle <on|off|show> | goal <show|set|clear|reset|here|draft> | compact",
     getArgumentCompletions: (prefix: string) => {
       const lower = prefix.toLowerCase();
       const firstSpace = lower.indexOf(" ");
@@ -1442,6 +1458,10 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         return suggest(["here"], () => "Seed the goal from your latest user message");
       if (first === "budget")
         return suggest(["0.5", "0.65", "0.7", "0.85"], (v) => `Ceiling ${Math.round(parseFloat(v) * 100)}% of model window`);
+      if (first === "settle")
+        return suggest(["on", "off", "show"], (v) =>
+          v === "show" ? "Show the current value" : `Settle-time compaction poke ${v}`
+        );
       if (first === "wake") {
         const WAKE_HELP: Record<string, string> = {
           once: "One self-compact nudge per idle streak (default 45m)",
@@ -1566,6 +1586,8 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         state.persisted.graceTurns = DEFAULT_GRACE_TURNS;
         state.persisted.keepAwakeMinutes = 0;
         state.persisted.idleCompactMinutes = DEFAULT_IDLE_COMPACT_MINUTES;
+        state.persisted.settleCompact = true;
+        state.persisted.settleNudgePending = false;
         state.persisted.overBudgetTurns = 0;
         state.persisted.idleCompactWarned = false;
         state.persisted.wakeDeferredUntil = 0;
@@ -1575,7 +1597,7 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
         ensureGlobalWatchdog();
         updateFooterStatus(ctx);
         ctx.ui.notify(
-          `Config reset to defaults: ${Math.round(DEFAULT_BUDGET_RATIO * 100)}% ceiling, ${DEFAULT_GRACE_TURNS} grace turns, ${DEFAULT_IDLE_COMPACT_MINUTES}m idle nudge, repeating cron off. Goal, KV notes and checkpoint state kept.`,
+          `Config reset to defaults: ${Math.round(DEFAULT_BUDGET_RATIO * 100)}% ceiling, ${DEFAULT_GRACE_TURNS} grace turns, settle poke on, ${DEFAULT_IDLE_COMPACT_MINUTES}m idle nudge, repeating cron off. Goal, KV notes and checkpoint state kept.`,
           "info"
         );
         return;
@@ -1673,6 +1695,23 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
           return;
         }
         ctx.ui.notify("Usage: /self-propagate wake <once|every> <minutes> | off", "warning");
+        return;
+      }
+
+      if (sub === "settle") {
+        const mode = (parts[1] || "show").toLowerCase();
+        if (mode === "on" || mode === "off") {
+          state.persisted.settleCompact = mode === "on";
+          state.persisted.settleNudgePending = false;
+          saveState(ctx);
+          ctx.ui.notify(`Settle-time compaction poke ${mode === "on" ? "enabled" : "disabled"}.`, "info");
+          return;
+        }
+        if (mode === "show") {
+          ctx.ui.notify(`Settle-time compaction poke is ${state.persisted.settleCompact ? "on" : "off"}.`, "info");
+          return;
+        }
+        ctx.ui.notify("Usage: /self-propagate settle <on|off|show>", "warning");
         return;
       }
 
@@ -1875,6 +1914,14 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     state.isBusy = true;
     state.persisted.idleCompactWarned = false;
     state.lastActiveAt = Date.now();
+    const prompt = (event as any)?.prompt;
+    if (
+      (event as any)?.messageType === "user" &&
+      typeof prompt === "string" &&
+      !/(settle_compact_poke|self_propagation_resume|force_compact|keep_awake_tick)/.test(prompt)
+    ) {
+      state.persisted.settleNudgePending = false;
+    }
 
     // Self-calibrating floor: the first request after a compaction measures the
     // smallest prefix this session can have (system + tools + checkpoint).
@@ -2039,5 +2086,15 @@ export default function selfPropagateExtension(pi: ExtensionAPI) {
     if (state.persisted.enabled && state.persisted.pendingCompaction) {
       executeScheduledCompaction(ctx);
     }
+  });
+
+  pi.on("agent_settled", async (event, ctx) => {
+    state.latestCtx = ctx;
+    if (!state.persisted.enabled || !state.persisted.settleCompact) return;
+    if (event.aborted || state.isCompacting || state.persisted.pendingCompaction) return;
+    if (state.persisted.settleNudgePending) return;
+    state.persisted.settleNudgePending = true;
+    saveState(ctx);
+    pi.sendUserMessage(SETTLE_COMPACT_POKE, { deliverAs: "steer" });
   });
 }

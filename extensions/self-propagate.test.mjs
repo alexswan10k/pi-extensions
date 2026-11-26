@@ -495,6 +495,54 @@ assert.match(p1.systemPrompt, /auto-compacts first when the prefix is 25k\+ \(or
   assert.match(notified(s), /kept/i, "reset reports what it preserves");
 }
 
+// ---- Phase 16: settle-time compaction poke (agent decides) ---------------------
+{
+  const s = boot("sess-settle");
+  await s.events.session_start({}, s.ctx);
+  await s.events.before_agent_start({ systemPrompt: "base" }, s.ctx);
+  assert.equal(s.readMemory().settleCompact, true, "settle poke on by default");
+  assert.equal(s.readMemory().settleNudgePending, false, "no poke pending at boot");
+
+  await s.events.agent_settled({ aborted: false }, s.ctx);
+  assert.equal(s.sent.length, 1, "one poke at settle");
+  assert.match(s.sent[0].msg, /settle_compact_poke/, "poke carries the marker tag");
+  assert.match(s.sent[0].msg, /self_compact/, "poke asks the agent to compact");
+  assert.match(s.sent[0].msg, /background/, "poke tells the agent to check background work");
+  assert.equal(s.readMemory().settleNudgePending, true, "latch persisted after poke");
+
+  await s.events.agent_settled({ aborted: false }, s.ctx);
+  assert.equal(s.sent.length, 1, "the poke's own settle does not re-poke");
+  await s.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: s.sent[0].msg }, s.ctx);
+  assert.equal(s.readMemory().settleNudgePending, true, "synthetic poke prompt keeps the latch");
+  await s.events.agent_settled({ aborted: false }, s.ctx);
+  assert.equal(s.sent.length, 1, "still no re-poke after a synthetic turn");
+
+  await s.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: "new real request" }, s.ctx);
+  assert.equal(s.readMemory().settleNudgePending, false, "a real prompt clears the latch");
+  await s.events.agent_settled({ aborted: false }, s.ctx);
+  assert.equal(s.sent.length, 2, "the next real settle pokes again");
+
+  await s.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: "another real request" }, s.ctx);
+  await s.events.agent_settled({ aborted: true }, s.ctx);
+  assert.equal(s.sent.length, 2, "aborted runs are not poked");
+
+  await s.commands["self-propagate"].handler("settle off", s.ctx);
+  assert.equal(s.readMemory().settleCompact, false, "settle switch persists off");
+  await s.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: "real request" }, s.ctx);
+  await s.events.agent_settled({ aborted: false }, s.ctx);
+  assert.equal(s.sent.length, 2, "no poke while switched off");
+
+  await s.commands["self-propagate"].handler("settle on", s.ctx);
+  await s.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: "real request" }, s.ctx);
+  await s.events.agent_settled({ aborted: false }, s.ctx);
+  assert.equal(s.sent.length, 3, "settle on restores the poke");
+
+  await s.commands["self-propagate"].handler("off", s.ctx);
+  await s.events.before_agent_start({ systemPrompt: "base", messageType: "user", prompt: "real request" }, s.ctx);
+  await s.events.agent_settled({ aborted: false }, s.ctx);
+  assert.equal(s.sent.length, 3, "no poke when compaction is disabled");
+}
+
 // ---- Housekeeping: atomic writes leave no tmp litter ---------------------------
 const leftovers = fs.readdirSync(path.join(dir, ".pi", "memory")).filter((f) => f.includes(".tmp."));
 assert.deepEqual(leftovers, [], "no .tmp files left behind");
